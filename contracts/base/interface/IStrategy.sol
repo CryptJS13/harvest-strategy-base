@@ -26,4 +26,6 @@ interface IStrategy {
     function strategist() external view returns (address);
 
     function morphoClaim(address _distr, bytes calldata _txData) external;
+
+    function preInteract() external;
 }
