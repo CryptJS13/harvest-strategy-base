@@ -22,4 +22,11 @@ contract FluidLendStrategyMainnet_EURC is FluidLendStrategy {
       weth
     );
   }
+
+  function finalizeUpgrade() override external onlyGovernance {
+    address fluid = address(0x61E030A56D33e8260FdD81f03B162A79Fe3449Cd);
+    _setRewardToken(fluid);
+    rewardTokens = [fluid];
+    _finalizeUpgrade();
+  }
 }

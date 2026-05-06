@@ -3,18 +3,13 @@ pragma solidity 0.8.26;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "../../base/interface/IUniversalLiquidator.sol";
-import "../../base/upgradability/BaseUpgradeableStrategy.sol";
-import "../../base/interface/moonwell/MTokenInterfaces.sol";
-import "../../base/interface/moonwell/ComptrollerInterface.sol";
-import "../../base/interface/moonwell/IOracle.sol";
-import "../../base/interface/aave/IPool.sol";
-import "../../base/interface/weth/IWETH.sol";
-import "./MoonwellViewer.sol";
+import "../../../base/interface/IUniversalLiquidator.sol";
+import "../../../base/upgradability/BaseUpgradeableStrategy.sol";
+import "../../../base/interface/aave/IAToken.sol";
+import "../../../base/interface/aave/IPool.sol";
+import "./AaveViewer.sol";
 
-import "hardhat/console.sol";
-
-contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
+contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
   using SafeERC20 for IERC20;
 
@@ -23,6 +18,7 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   struct FlashParams {
     FlashMode mode;
     uint256 redeemAmount;
+    uint256 collateralToRedeem;
     uint256 priceSupplyInBorrow;
     uint256 priceBorrowInSupply;
   }
@@ -35,16 +31,15 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     uint256 health;
   }
 
-  address public constant weth = address(0x4200000000000000000000000000000000000006);
-  address public constant aavePool = address(0xA238Dd80C259a72e81d7e4664a9801593F98d1c5);
-  address public constant viewer = address(0x8ccCD2467adD6053c8273042ac742Eb438444389);
+  address public constant viewer = address(0x1e51654aB193bA165b7F7715C734dAF454f08148);
   address public constant harvestMSIG = address(0x97b3e5712CDE7Db13e939a188C8CA90Db5B05131);
   uint256 public constant BPS = 10_000;
+  uint256 public constant MAX_SLIPPAGE_BPS = 100;
 
   // additional storage slots (on top of BaseUpgradeableStrategy ones) are defined here
-  bytes32 internal constant _SUPPLY_MTOKEN_SLOT = 0x5919a20ea6473dc6aa03868193793804048516941eec843dfc4ebf83cdee8205;
+  bytes32 internal constant _SUPPLY_ATOKEN_SLOT = 0x245f4d52f8837fdd7cb38b8b771b10e0c2c4eb20f8e39aec533f7dff93021e31;
   bytes32 internal constant _SUPPLY_ASSET_SLOT = 0xbbde6fefcbc73f647e3922d059c732eaa1d49b0805ba57644418e1845ceba5c5;
-  bytes32 internal constant _BORROW_MTOKEN_SLOT = 0xd0502c60148b6da9766e2c3019450fd4c4e9b2a0a434a3542b5bb13b7ba432f2;
+  bytes32 internal constant _BORROW_ATOKEN_SLOT = 0x7a779a15b70eeebb99374942f526b279a26022a49d0a6f2d84060f15a77861a9;
   bytes32 internal constant _STORED_BALANCE_SLOT = 0x36be27dce5926377a73445ec8b6a6c16c485af64395bbacfbf8aac4c71f8043b;
   bytes32 internal constant _PENDING_FEE_SLOT = 0x0af7af9f5ccfa82c3497f40c7c382677637aee27293a6243a22216b51481bd97;
   bytes32 internal constant _COLLATERALFACTORNUMERATOR_SLOT = 0x129eccdfbcf3761d8e2f66393221fa8277b7623ad13ed7693a0025435931c64a;
@@ -52,13 +47,10 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   bytes32 internal constant _FOLD_SLOT = 0x1841be4c16015a744c9fbf595f7c6b32d40278c16c1fc7cf2de88c6348de44ba;
   bytes32 internal constant _SLIPPAGE_BPS_SLOT = 0x9739c2fea70b5edd7eea812db3dffa2fb7638aaecdd2d30770ef5020cd8b9208;
 
-  // this would be reset on each upgrade
-  address[] public rewardTokens;
-
   constructor() BaseUpgradeableStrategy() {
-    assert(_SUPPLY_MTOKEN_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.supplyMToken")) - 1));
+    assert(_SUPPLY_ATOKEN_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.supplyAToken")) - 1));
     assert(_SUPPLY_ASSET_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.supplyAsset")) - 1));
-    assert(_BORROW_MTOKEN_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.borrowMToken")) - 1));
+    assert(_BORROW_ATOKEN_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.borrowAToken")) - 1));
     assert(_STORED_BALANCE_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.storedBalance")) - 1));
     assert(_PENDING_FEE_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.pendingFee")) - 1));
     assert(_COLLATERALFACTORNUMERATOR_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.collateralFactorNumerator")) - 1));
@@ -71,65 +63,70 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     address _storage,
     address _underlying,
     address _vault,
-    address _supplyMToken,
+    address _supplyAToken,
     address _supplyAsset,
-    address _borrowMToken,
-    address _comptroller,
-    address _rewardToken,
+    address _borrowAToken,
+    address _aavePool,
     uint256 _borrowTargetFactorNumerator,
     uint256 _collateralFactorNumerator,
     uint256 _slippageBps,
+    uint8 _eMode,
     bool _fold
   ) public initializer {
     BaseUpgradeableStrategy.initialize(
       _storage,
       _underlying,
       _vault,
-      _comptroller,
-      _rewardToken,
+      _aavePool,
+      address(0),
       harvestMSIG
     );
 
-    require(MErc20Interface(_supplyMToken).underlying() == _supplyAsset, "supAss");
-    require(MErc20Interface(_borrowMToken).underlying() == _underlying, "und");
+    require(IAToken(_supplyAToken).UNDERLYING_ASSET_ADDRESS() == _supplyAsset, "supAss");
+    require(IAToken(_borrowAToken).UNDERLYING_ASSET_ADDRESS() == _underlying, "und");
 
-    _setSupplyMToken(_supplyMToken);
+    _setSupplyAToken(_supplyAToken);
     _setSupplyAsset(_supplyAsset);
-    _setBorrowMToken(_borrowMToken);
+    _setBorrowAToken(_borrowAToken);
 
     require(_collateralFactorNumerator < BPS, "col");
     require(_borrowTargetFactorNumerator < _collateralFactorNumerator, "bor");
     setUint256(_COLLATERALFACTORNUMERATOR_SLOT, _collateralFactorNumerator);
     setUint256(_BORROWTARGETFACTORNUMERATOR_SLOT, _borrowTargetFactorNumerator);
     setBoolean(_FOLD_SLOT, _fold);
-    require(_slippageBps < 500, "slip");
+    require(_slippageBps <= MAX_SLIPPAGE_BPS, "slip");
     setUint256(_SLIPPAGE_BPS_SLOT, _slippageBps);
-    address[] memory markets = new address[](1);
-    markets[0] = _supplyMToken;
-    ComptrollerInterface(_comptroller).enterMarkets(markets);
+    if (_eMode > 0){
+      IPool(rewardPool()).setUserEMode(_eMode);
+    }
   }
 
   function preInteract() external restricted {
     _accrueFee();
   }
 
-  function _snapPosition() internal returns (PositionSnap memory s) {
-    address _supplyMToken = supplyMToken();
-    address _borrowMToken = borrowMToken();
+  function checker() external view returns (bool canExec, bytes memory execPayload) {
+    PositionSnap memory s = _snapPosition();
+    uint256 collateralLimit = _effectiveCollateralFactorNumerator();
+    canExec = (
+      fold() &&
+      s.borrowedDebt > 0 &&
+      collateralLimit <= borrowTargetFactorNumerator()
+    ) || s.health < (targetHealth() * 99) / 100;
+    execPayload = abi.encodeWithSelector(IController.doHardWork.selector, vault());
+  }
 
-    s.priceSupplyInBorrow = MoonwellViewer(viewer).getPrice(_supplyMToken, _borrowMToken);
-    s.priceBorrowInSupply = MoonwellViewer(viewer).getPrice(_borrowMToken, _supplyMToken);
+  function _snapPosition() internal view returns (PositionSnap memory s) {
+    address _supplyToken = supplyAsset();
+    address _borrowToken = underlying();
 
-    s.priceSupplyInBorrow = s.priceSupplyInBorrow * (BPS + slippageBps()*99/100) / BPS;
-    s.priceBorrowInSupply = s.priceBorrowInSupply * BPS / (BPS + slippageBps()*99/100);
-
-    // s.priceSupplyInBorrow = s.priceSupplyInBorrow * BPS / (BPS + slippageBps()*95/100);
-    // s.priceBorrowInSupply = s.priceBorrowInSupply * (BPS + slippageBps()*95/100) / BPS;
+    s.priceSupplyInBorrow = AaveViewer(viewer).getPrice(_supplyToken, _borrowToken);
+    s.priceBorrowInSupply = AaveViewer(viewer).getPrice(_borrowToken, _supplyToken);
     
-    s.borrowedDebt = MTokenInterface(_borrowMToken).borrowBalanceCurrent(address(this));
-    s.suppliedInDebt = (MTokenInterface(_supplyMToken).balanceOfUnderlying(address(this)) * s.priceSupplyInBorrow) / 1e18;
+    s.borrowedDebt = IERC20(borrowAToken()).balanceOf(address(this));
+    s.suppliedInDebt = (IERC20(supplyAToken()).balanceOf(address(this)) * s.priceSupplyInBorrow) / 1e18;
 
-    s.health = MoonwellViewer(viewer).getPositionHealth(_supplyMToken, _borrowMToken, collateralFactorNumerator());
+    s.health = AaveViewer(viewer).getPositionHealth();
   }
 
   function _currentBalance(PositionSnap memory s) internal pure returns (uint256) {
@@ -140,14 +137,12 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     if (!fold() || borrowTargetFactorNumerator() == 0) {
       return type(uint256).max;
     }
-    return (uint256(collateralFactorNumerator()) * 1e18) / borrowTargetFactorNumerator();
+    uint256 collateralLimit = _effectiveCollateralFactorNumerator();
+    if (collateralLimit <= borrowTargetFactorNumerator()) {
+      return 1e18;
+    }
+    return (collateralLimit * 1e18) / borrowTargetFactorNumerator();
   }
-
-  // function checker() external view returns (bool canExec, bytes memory execPayload) {
-  //   uint256 health = MoonwellViewer(viewer).getPositionHealth(supplyMToken(), borrowMToken(), collateralFactorNumerator());
-  //   canExec = health < (targetHealth() * 99) / 100;
-  //   execPayload = abi.encodeWithSelector(IController.doHardWork.selector, vault());
-  // }
 
   function storedBalance() public view returns (uint256) {
     return getUint256(_STORED_BALANCE_SLOT);
@@ -187,7 +182,7 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     if (fee <= 0) return;
     address _underlying = underlying();
     if (fold()) {
-      if (s.health > targetHealth()){
+      if (_effectiveCollateralFactorNumerator() > borrowTargetFactorNumerator() && s.health > targetHealth()){
         _borrow(fee);
         fee = Math.min(fee, IERC20(_underlying).balanceOf(address(this)));
         uint256 balanceIncrease = (fee * feeDenominator()) / totalFeeNumerator();
@@ -218,11 +213,10 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
   function unsalvagableTokens(address token) public view returns (bool) {
     return (
-      token == rewardToken() ||
       token == underlying() ||
-      token == supplyMToken() ||
+      token == supplyAToken() ||
       token == supplyAsset() ||
-      token == borrowMToken()
+      token == borrowAToken()
     );
   }
 
@@ -232,9 +226,7 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   function _investAllUnderlying() internal onlyNotPausedInvesting {
     address _underlying = underlying();
     uint256 underlyingBalance = IERC20(_underlying).balanceOf(address(this));
-    uint256 before = _currentBalance(_snapPosition());
 
-    console.log("to invest:                 ", underlyingBalance);
     if (underlyingBalance > 0) {
       PositionSnap memory s = _snapPosition();
       address _supplyAsset = supplyAsset();
@@ -245,9 +237,25 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       PositionSnap memory s2 = _snapPosition();
       _depositWithFlashloan(s2);
     }
-    if (underlyingBalance > 0) {
-      console.log("increase:                  ", _currentBalance(_snapPosition()) - before);
-      console.log("proportion:                ", ((_currentBalance(_snapPosition()) - before) * 10000) / underlyingBalance);
+  }
+
+  function _investUserUnderlying() internal onlyNotPausedInvesting {
+    address _underlying = underlying();
+    uint256 underlyingBalance = IERC20(_underlying).balanceOf(address(this));
+    if (underlyingBalance == 0) {
+      return;
+    }
+
+    PositionSnap memory beforeSnap = _snapPosition();
+    uint256 balanceBefore = _currentBalance(beforeSnap);
+    address _supplyAsset = supplyAsset();
+    _swap(_underlying, _supplyAsset, underlyingBalance, beforeSnap.priceSupplyInBorrow, beforeSnap.priceBorrowInSupply);
+    _supply(IERC20(_supplyAsset).balanceOf(address(this)));
+
+    if (fold()) {
+      // Only lever the newly added equity so existing vault capital is not retargeted
+      // during a user deposit.
+      _depositWithFlashloanMarginal(_snapPosition(), balanceBefore);
     }
   }
 
@@ -271,8 +279,6 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   function _withdrawMaximum(bool claim) internal {
     if (claim) {
       _handleFee();
-      _claimRewards();
-      _liquidateRewards();
     } else {
       _accrueFee();
     }
@@ -295,21 +301,28 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
     uint256 toRedeem = amountUnderlying - balance;
     // get some of the underlying
-    _redeemPartial(toRedeem, s);
+    if (fold()) {
+      _redeemProportionalWithFlashloan(toRedeem, s);
+    } else {
+      _redeemPartial(toRedeem, s);
+    }
 
-    // transfer the amount requested (or the amount we have) back to vault()
+    // Transfer the realized underlying back to the vault. The vault-side withdraw
+    // accounting decides how much belongs to the exiting user versus remaining holders.
     IERC20(_underlying).safeTransfer(vault(), IERC20(_underlying).balanceOf(address(this)));
     _updateStoredBalance();
   }
 
-  /**
-  * Withdraws all assets, liquidates XVS, and invests again in the required ratio.
-  */
   function doHardWork() public restricted {
     _handleFee();
-    _claimRewards();
-    _liquidateRewards();
     _investAllUnderlying();
+    _updateStoredBalance();
+  }
+
+  function doHardWorkOnDeposit() external restricted {
+    // Deposit-time path: invest only the newly transferred underlying and leave full-book
+    // maintenance for keeper/governance hard work.
+    _investUserUnderlying();
     _updateStoredBalance();
   }
 
@@ -348,76 +361,32 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     IERC20(token).safeTransfer(recipient, amount);
   }
 
-  function _claimRewards() internal {
-    ComptrollerInterface(rewardPool()).claimReward();
-  }
-
-  function addRewardToken(address _token) external onlyGovernance {
-    rewardTokens.push(_token);
-  }
-
-  function _liquidateRewards() internal {
-    if (!sell()) {
-      // Profits can be disabled for possible simplified and rapid exit
-      emit ProfitsNotCollected(sell(), false);
-      return;
-    }
-    address _rewardToken = rewardToken();
-    address _universalLiquidator = universalLiquidator();
-    for (uint256 i; i < rewardTokens.length; i++) {
-      address token = rewardTokens[i];
-      uint256 balance = IERC20(token).balanceOf(address(this));
-      if (token != _rewardToken && balance > 1e18){
-        IERC20(token).safeApprove(_universalLiquidator, 0);
-        IERC20(token).safeApprove(_universalLiquidator, balance);
-        IUniversalLiquidator(_universalLiquidator).swap(token, _rewardToken, balance, 1, address(this));
-      }
-    }
-    uint256 rewardBalance = IERC20(_rewardToken).balanceOf(address(this));
-
-    if (rewardBalance < 1e3) {
-      return;
-    }
-
-    _notifyProfitInRewardToken(_rewardToken, rewardBalance);
-    uint256 remainingRewardBalance = IERC20(_rewardToken).balanceOf(address(this));
-  
-    address _underlying = underlying();
-    if (_underlying != _rewardToken) {
-      IERC20(_rewardToken).safeApprove(_universalLiquidator, 0);
-      IERC20(_rewardToken).safeApprove(_universalLiquidator, remainingRewardBalance);
-      IUniversalLiquidator(_universalLiquidator).swap(_rewardToken, _underlying, remainingRewardBalance, 1, address(this));
-    }
-  }
-
   /**
   * Returns the current balance.
   */
   function investedUnderlyingBalance() public view returns (uint256) {
-    uint256 balance = IERC20(underlying()).balanceOf(address(this));
-    uint256 supplyBalance = IERC20(supplyAsset()).balanceOf(address(this));
+    address _supplyAsset = supplyAsset();
+    address _borrowAsset = underlying();
+    uint256 balance = IERC20(_borrowAsset).balanceOf(address(this));
+    uint256 supplyBalance = IERC20(_supplyAsset).balanceOf(address(this));
     if (supplyBalance > 0) {
-      supplyBalance = supplyBalance * MoonwellViewer(viewer).getPrice(supplyMToken(), borrowMToken()) / 1e18;
+      supplyBalance = supplyBalance * AaveViewer(viewer).getPrice(_supplyAsset, _borrowAsset) / 1e18;
     }
     return balance + supplyBalance + storedBalance() - pendingFee();
   }
 
   /**
-  * Supplies to Moonwel
+  * Supplies to Aave
   */
   function _supply(uint256 amount) internal {
-    if (amount == 0){
+    if (amount < 1e2){
       return;
     }
     address _supplyAsset = supplyAsset();
-    address _supplyMToken = supplyMToken();
-    uint256 exchange = MTokenInterface(_supplyMToken).exchangeRateCurrent();
-    if (amount < exchange / 1e18){
-      return;
-    }
-    IERC20(_supplyAsset).safeApprove(_supplyMToken, 0);
-    IERC20(_supplyAsset).safeApprove(_supplyMToken, amount);
-    MErc20Interface(_supplyMToken).mint(amount);
+    address _aavePool = rewardPool();
+    IERC20(_supplyAsset).safeApprove(_aavePool, 0);
+    IERC20(_supplyAsset).safeApprove(_aavePool, amount);
+    IPool(_aavePool).supply(_supplyAsset, amount, address(this), 0);
   }
 
   /**
@@ -428,56 +397,46 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       return;
     }
     // Borrow, check the balance for this contract's address
-    MErc20Interface(borrowMToken()).borrow(amountUnderlying);
-    if(underlying() == weth){
-      IWETH(weth).deposit{value: address(this).balance}();
-    }
+    IPool(rewardPool()).borrow(underlying(), amountUnderlying, 2, 0, address(this));
   }
 
   function _redeem(uint256 amountUnderlying) internal {
-    address _supplyMToken = supplyMToken();
-    address _supplyAsset = supplyAsset();
-    uint256 exchange = MTokenInterface(_supplyMToken).exchangeRateCurrent();
-    uint256 supplied = MTokenInterface(supplyMToken()).balanceOfUnderlying(address(this));
-    if (amountUnderlying < exchange / 1e18){
-      MErc20Interface(_supplyMToken).redeem(1);
-    } else if (amountUnderlying >= supplied) {
-      MErc20Interface(_supplyMToken).redeem(MTokenInterface(supplyMToken()).balanceOf(address(this)));
-    } else {
-      MErc20Interface(_supplyMToken).redeemUnderlying(amountUnderlying);
+    if (amountUnderlying == 0){
+      return;
     }
-    if(_supplyAsset == weth){
-      IWETH(weth).deposit{value: address(this).balance}();
-    }
+    IPool(rewardPool()).withdraw(supplyAsset(), amountUnderlying, address(this));
   }
+
 
   function _repay(uint256 amountUnderlying) internal {
     if (amountUnderlying == 0){
       return;
     }
     address _underlying = underlying();
-    address _borrowMToken = borrowMToken();
-    IERC20(_underlying).safeApprove(_borrowMToken, 0);
-    IERC20(_underlying).safeApprove(_borrowMToken, amountUnderlying);
-    MErc20Interface(_borrowMToken).repayBorrow(amountUnderlying);
+    address _aavePool = rewardPool();
+    IERC20(_underlying).safeApprove(_aavePool, 0);
+    IERC20(_underlying).safeApprove(_aavePool, amountUnderlying);
+    IPool(_aavePool).repay(_underlying, amountUnderlying, 2, address(this));
   }
 
   function _redeemMaximumWithFlashloan() internal {
     PositionSnap memory s = _snapPosition();
 
-    uint256 availableColl = MTokenInterface(supplyMToken()).getCash();
+    address _supplyAsset = supplyAsset();
+    address _supplyAToken = supplyAToken();
+    
+    uint256 availableColl = IERC20(_supplyAsset).balanceOf(_supplyAToken);
     uint256 availableDebt = availableColl * s.priceSupplyInBorrow / 1e18;
 
     uint256 balDebt = _currentBalance(s) - pendingFee();
     uint256 maxDebtOut = Math.min(availableDebt, balDebt);
 
     _redeemWithFlashloan(maxDebtOut, 0, s);
-    uint256 supplied = MTokenInterface(supplyMToken()).balanceOfUnderlying(address(this));
-    availableColl = MTokenInterface(supplyMToken()).getCash();
+    uint256 supplied = IERC20(_supplyAToken).balanceOf(address(this));
+    availableColl = IERC20(_supplyAsset).balanceOf(_supplyAToken);
     uint256 maxOut = Math.min(supplied, availableColl);
     if (maxOut > 0) {
       _redeem(maxOut);
-      address _supplyAsset = supplyAsset();
       _swap(
         _supplyAsset,
         underlying(),
@@ -489,7 +448,19 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   }
 
   function _depositWithFlashloan(PositionSnap memory s) internal {
-    uint _borrowNum = borrowTargetFactorNumerator();
+    uint256 _borrowNum = borrowTargetFactorNumerator();
+    uint256 collateralLimit = _effectiveCollateralFactorNumerator();
+
+    // If governance reduces the allowed collateral factor below the active borrow target,
+    // unwind instead of trying to maintain a potentially unsafe leveraged position.
+    if (_borrowNum == 0 || collateralLimit <= _borrowNum) {
+      if (s.borrowedDebt > 0) {
+        _redeemWithFlashloan(0, 0, s);
+      } else {
+        _handleDust(s);
+      }
+      return;
+    }
 
     uint256 _targetHealth = targetHealth();
     if (s.health < (_targetHealth * 99) / 100) {
@@ -506,17 +477,22 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     
     uint256 borrowDiff = 0;
     if (borrowTarget > s.borrowedDebt) {
-      borrowDiff = borrowTarget - s.borrowedDebt;
+      uint256 desiredDebtIncrease = borrowTarget - s.borrowedDebt;
+      uint256 premiumBps = IPool(rewardPool()).FLASHLOAN_PREMIUM_TOTAL();
+      borrowDiff = premiumBps == 0
+        ? desiredDebtIncrease
+        : (desiredDebtIncrease * BPS) / (BPS + premiumBps);
     }
 
     if (borrowDiff > 0) {
       bytes memory params = abi.encode(FlashParams({
         mode: FlashMode.Deposit,
         redeemAmount: 0,
+        collateralToRedeem: 0,
         priceSupplyInBorrow: s.priceSupplyInBorrow,
         priceBorrowInSupply: s.priceBorrowInSupply
       }));
-      IPool(aavePool).flashLoanSimple(
+      IPool(rewardPool()).flashLoanSimple(
         address(this),
         underlying(),
         borrowDiff,
@@ -525,6 +501,55 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       );
     }
     _handleDust(s);
+  }
+
+  function _depositWithFlashloanMarginal(PositionSnap memory s, uint256 balanceBefore) internal {
+    uint256 _borrowNum = borrowTargetFactorNumerator();
+    uint256 collateralLimit = _effectiveCollateralFactorNumerator();
+
+    if (_borrowNum == 0 || collateralLimit <= _borrowNum) {
+      return;
+    }
+
+    if (s.health < ((targetHealth() * 101) / 100)) {
+      return;
+    }
+
+    uint256 balanceAfter = _currentBalance(s);
+    if (balanceAfter <= balanceBefore) {
+      return;
+    }
+
+    // The marginal deposit should reach the same target leverage as the rest of the book,
+    // but only for the user-added equity realized in this interaction.
+    uint256 addedBalance = balanceAfter - balanceBefore;
+    uint256 borrowDiff = (addedBalance * _borrowNum) / (BPS - _borrowNum);
+    if (borrowDiff == 0) {
+      return;
+    }
+
+    uint256 premiumBps = IPool(rewardPool()).FLASHLOAN_PREMIUM_TOTAL();
+    if (premiumBps > 0) {
+      borrowDiff = (borrowDiff * BPS) / (BPS + premiumBps);
+    }
+    if (borrowDiff == 0) {
+      return;
+    }
+
+    bytes memory params = abi.encode(FlashParams({
+      mode: FlashMode.Deposit,
+      redeemAmount: 0,
+      collateralToRedeem: 0,
+      priceSupplyInBorrow: s.priceSupplyInBorrow,
+      priceBorrowInSupply: s.priceBorrowInSupply
+    }));
+    IPool(rewardPool()).flashLoanSimple(
+      address(this),
+      underlying(),
+      borrowDiff,
+      params,
+      0
+    );
   }
 
   function _redeemWithFlashloan(uint256 amount, uint256 _borrowTargetFactorNumerator, PositionSnap memory s) internal {    
@@ -542,10 +567,11 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       bytes memory params = abi.encode(FlashParams({
         mode: FlashMode.Withdraw,
         redeemAmount: amount,
+        collateralToRedeem: 0,
         priceSupplyInBorrow: s.priceSupplyInBorrow,
         priceBorrowInSupply: s.priceBorrowInSupply
       }));
-      IPool(aavePool).flashLoanSimple(
+      IPool(rewardPool()).flashLoanSimple(
         address(this),
         underlying(),
         borrowDiff,
@@ -566,8 +592,50 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
   }
 
+  function _redeemProportionalWithFlashloan(uint256 amountUnderlying, PositionSnap memory s) internal {
+    uint256 positionBalance = _currentBalance(s);
+    if (positionBalance == 0 || amountUnderlying == 0) {
+      return;
+    }
+
+    uint256 proportion = (amountUnderlying * 1e18) / positionBalance;
+    if (proportion > 1e18) {
+      proportion = 1e18;
+    }
+
+    uint256 borrowed = s.borrowedDebt;
+    uint256 repayAmount = (borrowed * proportion) / 1e18;
+    uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
+    uint256 collateralToRedeem = (supplied * proportion) / 1e18;
+
+    if (repayAmount > 0) {
+      bytes memory params = abi.encode(FlashParams({
+        mode: FlashMode.Withdraw,
+        redeemAmount: 0,
+        collateralToRedeem: collateralToRedeem,
+        priceSupplyInBorrow: s.priceSupplyInBorrow,
+        priceBorrowInSupply: s.priceBorrowInSupply
+      }));
+      IPool(rewardPool()).flashLoanSimple(
+        address(this),
+        underlying(),
+        repayAmount,
+        params,
+        0
+      );
+    } else if (collateralToRedeem > 0) {
+      _redeem(collateralToRedeem);
+      address coll = supplyAsset();
+      uint256 collBal = IERC20(coll).balanceOf(address(this));
+      if (collBal > 0) {
+        _swap(coll, underlying(), collBal, s.priceSupplyInBorrow, s.priceBorrowInSupply);
+      }
+    }
+  }
+
   function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes memory params) external nonReentrant() returns (bool) {
-    require(msg.sender == address(aavePool), "!pool");
+    address _aavePool = rewardPool();
+    require(msg.sender == _aavePool, "!pool");
     require(initiator == address(this), "!sender");
     FlashParams memory flashParams = abi.decode(params, (FlashParams));
     uint256 toRepay = amount + premium;
@@ -575,11 +643,19 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     if (flashParams.mode == FlashMode.Deposit){
       _onFlashDeposit(asset, amount, toRepay, flashParams.priceSupplyInBorrow, flashParams.priceBorrowInSupply);
     } else {
-      _onFlashWithdraw(asset, amount, toRepay, flashParams.redeemAmount, flashParams.priceSupplyInBorrow, flashParams.priceBorrowInSupply);
+      _onFlashWithdraw(
+        asset,
+        amount,
+        toRepay,
+        flashParams.redeemAmount,
+        flashParams.collateralToRedeem,
+        flashParams.priceSupplyInBorrow,
+        flashParams.priceBorrowInSupply
+      );
     }
 
-    IERC20(asset).safeApprove(aavePool, 0);
-    IERC20(asset).safeApprove(aavePool, toRepay);
+    IERC20(asset).safeApprove(_aavePool, 0);
+    IERC20(asset).safeApprove(_aavePool, toRepay);
 
     return true;
   }
@@ -591,14 +667,29 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     _borrow(toRepay);
   }
 
-  function _onFlashWithdraw(address asset, uint256 amount, uint256 toRepay, uint256 redeemAmount, uint256 priceSupplyInBorrow, uint256 priceBorrowInSupply) internal {
-    address _borrowMToken = borrowMToken();
-    uint256 borrowed = MTokenInterface(_borrowMToken).borrowBalanceCurrent(address(this));
+  function _onFlashWithdraw(
+    address asset,
+    uint256 amount,
+    uint256 toRepay,
+    uint256 redeemAmount,
+    uint256 collateralToRedeem,
+    uint256 priceSupplyInBorrow,
+    uint256 priceBorrowInSupply
+  ) internal {
+    address _borrowAToken = borrowAToken();
+    uint256 borrowed = IERC20(_borrowAToken).balanceOf(address(this));
     uint256 repaying = Math.min(amount, borrowed);
     _repay(repaying);
-    uint256 toRedeem = (toRepay + redeemAmount) * priceBorrowInSupply / 1e18;
-    uint256 supplied = MTokenInterface(supplyMToken()).balanceOfUnderlying(address(this));
-    toRedeem = Math.min(toRedeem, supplied);
+    uint256 toRedeem = 0;
+    if (collateralToRedeem > 0) {
+      uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
+      toRedeem = Math.min(collateralToRedeem, supplied);
+    } else {
+      toRedeem = (toRepay + redeemAmount) * priceBorrowInSupply / 1e18;
+      toRedeem = (toRedeem * (BPS + slippageBps())) / BPS;
+      uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
+      toRedeem = Math.min(toRedeem, supplied);
+    }
     _redeem(toRedeem);
     address _supplyAsset = supplyAsset();
     uint256 supplyAssetBalance = IERC20(_supplyAsset).balanceOf(address(this));
@@ -632,19 +723,11 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     IERC20(from).safeApprove(_universalLiquidator, amount);
     uint256 minOut = _minOut(from, to, amount, priceSupplyInBorrow, priceBorrowInSupply);
     IUniversalLiquidator(_universalLiquidator).swap(from, to, amount, minOut, address(this));
-
-    console.log("Swap amount:", amount);
-    uint256 oraclePrice = from == supplyAsset() ? priceSupplyInBorrow : priceBorrowInSupply;
-    console.log("oraclePrice:", oraclePrice);
-    uint256 swappedAmount = IERC20(to).balanceOf(address(this));
-    uint256 effectivePrice = (swappedAmount * 1e18) / amount;
-    console.log("marketPrice:", effectivePrice);
-    console.log("proportion: ", (effectivePrice * 1000000) / oraclePrice);
   }
 
   function _handleDust(PositionSnap memory s) internal {
     uint256 baBalance = IERC20(underlying()).balanceOf(address(this));
-    uint256 borrowed = MTokenInterface(borrowMToken()).borrowBalanceCurrent(address(this));
+    uint256 borrowed = IERC20(borrowAToken()).balanceOf(address(this));
     if (baBalance > 0) {
       if (borrowed > 0) _repay(Math.min(baBalance, borrowed));
       uint256 rest = IERC20(underlying()).balanceOf(address(this));
@@ -671,6 +754,11 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     return getUint256(_COLLATERALFACTORNUMERATOR_SLOT);
   }
 
+  function _effectiveCollateralFactorNumerator() internal view returns (uint256) {
+    (,,,uint256 liquidationThreshold,,) = IPool(rewardPool()).getUserAccountData(address(this));
+    return Math.min(collateralFactorNumerator(), liquidationThreshold);
+  }
+
   function setBorrowTargetFactorNumerator(uint256 _numerator) public onlyGovernance {
     require(_numerator < collateralFactorNumerator(), "Bor");
     setUint256(_BORROWTARGETFACTORNUMERATOR_SLOT, _numerator);
@@ -684,7 +772,7 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     if (!_fold) {
       setBorrowTargetFactorNumerator(0);
       _redeemPartial(0, _snapPosition());  
-      uint256 borrowed = MTokenInterface(borrowMToken()).borrowBalanceCurrent(address(this));
+      uint256 borrowed = IERC20(borrowAToken()).balanceOf(address(this));
       require (borrowed == 0, "setFold");
     }
     setBoolean(_FOLD_SLOT, _fold);
@@ -695,7 +783,7 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   }
 
   function setSlippageBps (uint256 _slippageBps) public onlyGovernance {
-    require(_slippageBps <= 500, "slip");
+    require(_slippageBps <= MAX_SLIPPAGE_BPS, "slip");
     setUint256(_SLIPPAGE_BPS_SLOT, _slippageBps);
   }
 
@@ -703,12 +791,12 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     return getUint256(_SLIPPAGE_BPS_SLOT);
   }
 
-  function _setSupplyMToken (address _target) internal {
-    setAddress(_SUPPLY_MTOKEN_SLOT, _target);
+  function _setSupplyAToken (address _target) internal {
+    setAddress(_SUPPLY_ATOKEN_SLOT, _target);
   }
 
-  function supplyMToken() public view returns (address) {
-    return getAddress(_SUPPLY_MTOKEN_SLOT);
+  function supplyAToken() public view returns (address) {
+    return getAddress(_SUPPLY_ATOKEN_SLOT);
   }
 
   function _setSupplyAsset (address _target) internal {
@@ -719,12 +807,12 @@ contract Moonwell2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     return getAddress(_SUPPLY_ASSET_SLOT);
   }
 
-  function _setBorrowMToken (address _target) internal {
-    setAddress(_BORROW_MTOKEN_SLOT, _target);
+  function _setBorrowAToken (address _target) internal {
+    setAddress(_BORROW_ATOKEN_SLOT, _target);
   }
 
-  function borrowMToken() public view returns (address) {
-    return getAddress(_BORROW_MTOKEN_SLOT);
+  function borrowAToken() public view returns (address) {
+    return getAddress(_BORROW_ATOKEN_SLOT);
   }
 
   function finalizeUpgrade() external onlyGovernance {

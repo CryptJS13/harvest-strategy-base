@@ -1,3 +1,7 @@
+if (typeof File === "undefined") {
+  global.File = class File {};
+}
+
 require("@nomicfoundation/hardhat-verify");
 require("@nomiclabs/hardhat-truffle5");
 require("@nomiclabs/hardhat-web3");

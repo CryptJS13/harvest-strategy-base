@@ -220,7 +220,15 @@ async function setupCoreProtocol(config) {
 
 async function depositVault(_farmer, _underlying, _vault, _amount) {
   await _underlying.approve(_vault.address, _amount, { from: _farmer });
+  const oldSharePrice = new BigNumber(await _vault.getPricePerFullShare());
+  console.log("Depositing to vault, amount: ", _amount.toString());
   await _vault.deposit(_amount, _farmer, { from: _farmer });
+  const newSharePrice = new BigNumber(await _vault.getPricePerFullShare());
+
+  console.log("Deposit: old shareprice: ", oldSharePrice.toFixed());
+  console.log("Deposit: new shareprice: ", newSharePrice.toFixed());
+  console.log("Deposit: growth:         ", (newSharePrice.toFixed() / oldSharePrice.toFixed() - 1) * 100, "%");
+  
 }
 
 module.exports = {

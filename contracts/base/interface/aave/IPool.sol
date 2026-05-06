@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import "./DataTypes.sol";
 
 interface IPool {
+  function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
   function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf) external;
   function repay(address asset, uint256 amount, uint256 interestRateMode, address onBehalfOf) external;
   function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
@@ -16,4 +17,13 @@ interface IPool {
     bytes calldata params,
     uint16 referralCode
   ) external;
+  function getUserAccountData(address user) external view returns (
+    uint256 totalCollateralBase,
+    uint256 totalDebtBase,
+    uint256 availableBorrowsBase,
+    uint256 currentLiquidationThreshold,
+    uint256 ltv,
+    uint256 healthFactor
+  );
+  function setUserEMode(uint8 categoryId) external;
 }
