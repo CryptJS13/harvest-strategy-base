@@ -1,3 +1,7 @@
+if (typeof File === "undefined") {
+  global.File = class File {};
+}
+
 require("@nomicfoundation/hardhat-verify");
 require("@nomiclabs/hardhat-truffle5");
 require("@nomiclabs/hardhat-web3");
@@ -23,7 +27,7 @@ module.exports = {
       chainId: 8453,
       forking: {
         url: `https://base-mainnet.g.alchemy.com/v2/${process.env.ALCHEMEY_KEY}`,
-        blockNumber: 37210850, // <-- edit here
+        blockNumber: 44729683, // <-- edit here
       },
       allowUnlimitedContractSize: true,
     },

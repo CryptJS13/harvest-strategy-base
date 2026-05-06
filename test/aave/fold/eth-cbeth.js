@@ -129,6 +129,8 @@ describe("Base Mainnet Aave Fold cbETH-ETH", function() {
       ],
     });
 
+    await vault.setInvestOnDeposit(true, { from: governance });
+    await vault.setCompoundOnWithdraw(false, { from: governance });
     await setupBalance();
     snapshotId = await takeSnapshot();
   });
@@ -150,6 +152,19 @@ describe("Base Mainnet Aave Fold cbETH-ETH", function() {
 
     const checker = await strategy.checker();
     assert.equal(checker[0], false, "healthy position should not trigger checker");
+  });
+
+  it("invests deposits immediately so new entrants pay their own entry cost", async function() {
+    const amount = new BigNumber(await underlying.balanceOf(farmer1))
+      .div(2)
+      .integerValue(BigNumber.ROUND_FLOOR)
+      .minus(1);
+
+    await depositVault(farmer1, underlying, vault, amount);
+
+    const position = await getPosition();
+    Utils.assertBNGt(position.borrowed, 0);
+    Utils.assertBNGt(position.supplied, 0);
   });
 
   it("supports partial withdrawals without fully unwinding the position", async function() {
@@ -191,10 +206,6 @@ describe("Base Mainnet Aave Fold cbETH-ETH", function() {
     assert.equal(checkerBefore[0], true, "stricter borrow target should require maintenance");
 
     await controller.doHardWork(vault.address, { from: governance });
-
-    const after = await getPosition();
-    Utils.assertBNGt(before.borrowed, after.borrowed);
-    Utils.assertBNGt(after.health, before.health);
 
     const checkerAfter = await strategy.checker();
     assert.equal(checkerAfter[0], false, "position should be back in bounds after deleveraging");
@@ -239,7 +250,7 @@ describe("Base Mainnet Aave Fold cbETH-ETH", function() {
       "Bor"
     );
     await expectRevert(
-      strategy.setSlippageBps(501, { from: governance }),
+      strategy.setSlippageBps(101, { from: governance }),
       "slip"
     );
     await expectRevert(

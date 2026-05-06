@@ -18,6 +18,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   struct FlashParams {
     FlashMode mode;
     uint256 redeemAmount;
+    uint256 collateralToRedeem;
     uint256 priceSupplyInBorrow;
     uint256 priceBorrowInSupply;
   }
@@ -33,6 +34,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   address public constant viewer = address(0x1e51654aB193bA165b7F7715C734dAF454f08148);
   address public constant harvestMSIG = address(0x97b3e5712CDE7Db13e939a188C8CA90Db5B05131);
   uint256 public constant BPS = 10_000;
+  uint256 public constant MAX_SLIPPAGE_BPS = 100;
 
   // additional storage slots (on top of BaseUpgradeableStrategy ones) are defined here
   bytes32 internal constant _SUPPLY_ATOKEN_SLOT = 0x245f4d52f8837fdd7cb38b8b771b10e0c2c4eb20f8e39aec533f7dff93021e31;
@@ -92,7 +94,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     setUint256(_COLLATERALFACTORNUMERATOR_SLOT, _collateralFactorNumerator);
     setUint256(_BORROWTARGETFACTORNUMERATOR_SLOT, _borrowTargetFactorNumerator);
     setBoolean(_FOLD_SLOT, _fold);
-    require(_slippageBps < 500, "slip");
+    require(_slippageBps <= MAX_SLIPPAGE_BPS, "slip");
     setUint256(_SLIPPAGE_BPS_SLOT, _slippageBps);
     if (_eMode > 0){
       IPool(rewardPool()).setUserEMode(_eMode);
@@ -141,12 +143,6 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
     return (collateralLimit * 1e18) / borrowTargetFactorNumerator();
   }
-
-  // function checker() external view returns (bool canExec, bytes memory execPayload) {
-  //   uint256 health = MoonwellViewer(viewer).getPositionHealth(supplyMToken(), borrowMToken(), collateralFactorNumerator());
-  //   canExec = health < (targetHealth() * 99) / 100;
-  //   execPayload = abi.encodeWithSelector(IController.doHardWork.selector, vault());
-  // }
 
   function storedBalance() public view returns (uint256) {
     return getUint256(_STORED_BALANCE_SLOT);
@@ -243,6 +239,26 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
   }
 
+  function _investUserUnderlying() internal onlyNotPausedInvesting {
+    address _underlying = underlying();
+    uint256 underlyingBalance = IERC20(_underlying).balanceOf(address(this));
+    if (underlyingBalance == 0) {
+      return;
+    }
+
+    PositionSnap memory beforeSnap = _snapPosition();
+    uint256 balanceBefore = _currentBalance(beforeSnap);
+    address _supplyAsset = supplyAsset();
+    _swap(_underlying, _supplyAsset, underlyingBalance, beforeSnap.priceSupplyInBorrow, beforeSnap.priceBorrowInSupply);
+    _supply(IERC20(_supplyAsset).balanceOf(address(this)));
+
+    if (fold()) {
+      // Only lever the newly added equity so existing vault capital is not retargeted
+      // during a user deposit.
+      _depositWithFlashloanMarginal(_snapPosition(), balanceBefore);
+    }
+  }
+
   /**
   * Exits Moonwell and transfers everything to the vault.
   */
@@ -285,9 +301,14 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
     uint256 toRedeem = amountUnderlying - balance;
     // get some of the underlying
-    _redeemPartial(toRedeem, s);
+    if (fold()) {
+      _redeemProportionalWithFlashloan(toRedeem, s);
+    } else {
+      _redeemPartial(toRedeem, s);
+    }
 
-    // transfer the amount requested (or the amount we have) back to vault()
+    // Transfer the realized underlying back to the vault. The vault-side withdraw
+    // accounting decides how much belongs to the exiting user versus remaining holders.
     IERC20(_underlying).safeTransfer(vault(), IERC20(_underlying).balanceOf(address(this)));
     _updateStoredBalance();
   }
@@ -295,6 +316,13 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   function doHardWork() public restricted {
     _handleFee();
     _investAllUnderlying();
+    _updateStoredBalance();
+  }
+
+  function doHardWorkOnDeposit() external restricted {
+    // Deposit-time path: invest only the newly transferred underlying and leave full-book
+    // maintenance for keeper/governance hard work.
+    _investUserUnderlying();
     _updateStoredBalance();
   }
 
@@ -460,6 +488,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       bytes memory params = abi.encode(FlashParams({
         mode: FlashMode.Deposit,
         redeemAmount: 0,
+        collateralToRedeem: 0,
         priceSupplyInBorrow: s.priceSupplyInBorrow,
         priceBorrowInSupply: s.priceBorrowInSupply
       }));
@@ -472,6 +501,55 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       );
     }
     _handleDust(s);
+  }
+
+  function _depositWithFlashloanMarginal(PositionSnap memory s, uint256 balanceBefore) internal {
+    uint256 _borrowNum = borrowTargetFactorNumerator();
+    uint256 collateralLimit = _effectiveCollateralFactorNumerator();
+
+    if (_borrowNum == 0 || collateralLimit <= _borrowNum) {
+      return;
+    }
+
+    if (s.health < ((targetHealth() * 101) / 100)) {
+      return;
+    }
+
+    uint256 balanceAfter = _currentBalance(s);
+    if (balanceAfter <= balanceBefore) {
+      return;
+    }
+
+    // The marginal deposit should reach the same target leverage as the rest of the book,
+    // but only for the user-added equity realized in this interaction.
+    uint256 addedBalance = balanceAfter - balanceBefore;
+    uint256 borrowDiff = (addedBalance * _borrowNum) / (BPS - _borrowNum);
+    if (borrowDiff == 0) {
+      return;
+    }
+
+    uint256 premiumBps = IPool(rewardPool()).FLASHLOAN_PREMIUM_TOTAL();
+    if (premiumBps > 0) {
+      borrowDiff = (borrowDiff * BPS) / (BPS + premiumBps);
+    }
+    if (borrowDiff == 0) {
+      return;
+    }
+
+    bytes memory params = abi.encode(FlashParams({
+      mode: FlashMode.Deposit,
+      redeemAmount: 0,
+      collateralToRedeem: 0,
+      priceSupplyInBorrow: s.priceSupplyInBorrow,
+      priceBorrowInSupply: s.priceBorrowInSupply
+    }));
+    IPool(rewardPool()).flashLoanSimple(
+      address(this),
+      underlying(),
+      borrowDiff,
+      params,
+      0
+    );
   }
 
   function _redeemWithFlashloan(uint256 amount, uint256 _borrowTargetFactorNumerator, PositionSnap memory s) internal {    
@@ -489,6 +567,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       bytes memory params = abi.encode(FlashParams({
         mode: FlashMode.Withdraw,
         redeemAmount: amount,
+        collateralToRedeem: 0,
         priceSupplyInBorrow: s.priceSupplyInBorrow,
         priceBorrowInSupply: s.priceBorrowInSupply
       }));
@@ -513,6 +592,47 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
   }
 
+  function _redeemProportionalWithFlashloan(uint256 amountUnderlying, PositionSnap memory s) internal {
+    uint256 positionBalance = _currentBalance(s);
+    if (positionBalance == 0 || amountUnderlying == 0) {
+      return;
+    }
+
+    uint256 proportion = (amountUnderlying * 1e18) / positionBalance;
+    if (proportion > 1e18) {
+      proportion = 1e18;
+    }
+
+    uint256 borrowed = s.borrowedDebt;
+    uint256 repayAmount = (borrowed * proportion) / 1e18;
+    uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
+    uint256 collateralToRedeem = (supplied * proportion) / 1e18;
+
+    if (repayAmount > 0) {
+      bytes memory params = abi.encode(FlashParams({
+        mode: FlashMode.Withdraw,
+        redeemAmount: 0,
+        collateralToRedeem: collateralToRedeem,
+        priceSupplyInBorrow: s.priceSupplyInBorrow,
+        priceBorrowInSupply: s.priceBorrowInSupply
+      }));
+      IPool(rewardPool()).flashLoanSimple(
+        address(this),
+        underlying(),
+        repayAmount,
+        params,
+        0
+      );
+    } else if (collateralToRedeem > 0) {
+      _redeem(collateralToRedeem);
+      address coll = supplyAsset();
+      uint256 collBal = IERC20(coll).balanceOf(address(this));
+      if (collBal > 0) {
+        _swap(coll, underlying(), collBal, s.priceSupplyInBorrow, s.priceBorrowInSupply);
+      }
+    }
+  }
+
   function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes memory params) external nonReentrant() returns (bool) {
     address _aavePool = rewardPool();
     require(msg.sender == _aavePool, "!pool");
@@ -523,7 +643,15 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     if (flashParams.mode == FlashMode.Deposit){
       _onFlashDeposit(asset, amount, toRepay, flashParams.priceSupplyInBorrow, flashParams.priceBorrowInSupply);
     } else {
-      _onFlashWithdraw(asset, amount, toRepay, flashParams.redeemAmount, flashParams.priceSupplyInBorrow, flashParams.priceBorrowInSupply);
+      _onFlashWithdraw(
+        asset,
+        amount,
+        toRepay,
+        flashParams.redeemAmount,
+        flashParams.collateralToRedeem,
+        flashParams.priceSupplyInBorrow,
+        flashParams.priceBorrowInSupply
+      );
     }
 
     IERC20(asset).safeApprove(_aavePool, 0);
@@ -539,15 +667,29 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     _borrow(toRepay);
   }
 
-  function _onFlashWithdraw(address asset, uint256 amount, uint256 toRepay, uint256 redeemAmount, uint256 priceSupplyInBorrow, uint256 priceBorrowInSupply) internal {
+  function _onFlashWithdraw(
+    address asset,
+    uint256 amount,
+    uint256 toRepay,
+    uint256 redeemAmount,
+    uint256 collateralToRedeem,
+    uint256 priceSupplyInBorrow,
+    uint256 priceBorrowInSupply
+  ) internal {
     address _borrowAToken = borrowAToken();
     uint256 borrowed = IERC20(_borrowAToken).balanceOf(address(this));
     uint256 repaying = Math.min(amount, borrowed);
     _repay(repaying);
-    uint256 toRedeem = (toRepay + redeemAmount) * priceBorrowInSupply / 1e18;
-    toRedeem = (toRedeem * (BPS + slippageBps())) / BPS;
-    uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
-    toRedeem = Math.min(toRedeem, supplied);
+    uint256 toRedeem = 0;
+    if (collateralToRedeem > 0) {
+      uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
+      toRedeem = Math.min(collateralToRedeem, supplied);
+    } else {
+      toRedeem = (toRepay + redeemAmount) * priceBorrowInSupply / 1e18;
+      toRedeem = (toRedeem * (BPS + slippageBps())) / BPS;
+      uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
+      toRedeem = Math.min(toRedeem, supplied);
+    }
     _redeem(toRedeem);
     address _supplyAsset = supplyAsset();
     uint256 supplyAssetBalance = IERC20(_supplyAsset).balanceOf(address(this));
@@ -641,7 +783,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   }
 
   function setSlippageBps (uint256 _slippageBps) public onlyGovernance {
-    require(_slippageBps <= 500, "slip");
+    require(_slippageBps <= MAX_SLIPPAGE_BPS, "slip");
     setUint256(_SLIPPAGE_BPS_SLOT, _slippageBps);
   }
 

@@ -385,21 +385,32 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
     require(beneficiary != address(0), "holder must be defined");
 
     address _strategy = strategy();
+    uint256 totalSupplyBefore = totalSupply();
     IStrategy(_strategy).preInteract();
     uint256 balanceBefore = underlyingBalanceWithInvestment();
 
     IERC20Upgradeable(underlying()).safeTransferFrom(sender, address(this), amount);    
     if (investOnDeposit()) {
       invest();
-      IStrategy(_strategy).doHardWork();
+      // Strategies that support immediate marginal investing can implement a dedicated
+      // deposit hook so the depositor bears only their own entry cost.
+      (bool success, bytes memory data) = _strategy.call(abi.encodeWithSignature("doHardWorkOnDeposit()"));
+      if (!success) {
+        if (data.length > 0) {
+          assembly {
+            revert(add(data, 32), mload(data))
+          }
+        }
+        IStrategy(_strategy).doHardWork();
+      }
     }
 
     uint256 balanceAfter = underlyingBalanceWithInvestment();
     uint256 actualAmount = balanceAfter.sub(balanceBefore);
 
-    uint256 toMint = totalSupply() == 0
+    uint256 toMint = totalSupplyBefore == 0
         ? actualAmount
-        : actualAmount.mul(totalSupply()).div(underlyingBalanceWithInvestment().sub(actualAmount));
+        : actualAmount.mul(totalSupplyBefore).div(balanceBefore);
     _mint(beneficiary, toMint);
 
     emit IERC4626.Deposit(sender, beneficiary, actualAmount, toMint);
@@ -416,7 +427,7 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
   function _withdraw(uint256 numberOfShares, address receiver, address owner) internal returns (uint256) {
     require(totalSupply() > 0, "Vault has no shares");
     require(numberOfShares > 0, "numberOfShares must be greater than 0");
-    uint256 totalSupply = totalSupply();
+    uint256 totalSupplyBefore = totalSupply();
 
     address sender = msg.sender;
     if (sender != owner) {
@@ -426,7 +437,6 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
         _approve(owner, sender, currentAllowance - numberOfShares);
       }
     }
-    _burn(owner, numberOfShares);
 
     address _strategy = strategy();
     IStrategy(_strategy).preInteract();
@@ -435,17 +445,31 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
       IStrategy(_strategy).doHardWork();
     }
 
-    uint256 underlyingAmountToWithdraw = underlyingBalanceWithInvestment()
+    uint256 assetsBefore = underlyingBalanceWithInvestment();
+    _burn(owner, numberOfShares);
+
+    uint256 underlyingAmountToWithdraw = assetsBefore
         .mul(numberOfShares)
-        .div(totalSupply);
+        .div(totalSupplyBefore);
     if (underlyingAmountToWithdraw > underlyingBalanceInVault()) {
-      if (numberOfShares == totalSupply) {
+      if (numberOfShares == totalSupplyBefore) {
         IStrategy(_strategy).withdrawAllToVault();
       } else {
         uint256 missing = underlyingAmountToWithdraw.sub(underlyingBalanceInVault());
         IStrategy(_strategy).withdrawToVault(missing);
       }
+    }
+
+    uint256 remainingShares = totalSupplyBefore.sub(numberOfShares);
+    uint256 assetsAfter = underlyingBalanceWithInvestment();
+    if (remainingShares == 0) {
       underlyingAmountToWithdraw = underlyingBalanceInVault();
+    } else {
+      uint256 targetRemainingAssets = assetsBefore
+          .mul(remainingShares)
+          .div(totalSupplyBefore);
+      underlyingAmountToWithdraw = assetsAfter.sub(targetRemainingAssets);
+      underlyingAmountToWithdraw = MathUpgradeable.min(underlyingAmountToWithdraw, underlyingBalanceInVault());
     }
 
     IERC20Upgradeable(underlying()).safeTransfer(receiver, underlyingAmountToWithdraw);
