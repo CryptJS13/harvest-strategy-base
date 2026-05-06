@@ -21,6 +21,19 @@ contract CLVaultStorage is Initializable {
     bytes32 internal constant _NEXT_STRATEGY_SLOT = 0xcd7bd9250b0e02f3b13eccf8c73ef5543cb618e0004628f9ca53b65fbdbde2d0;
     bytes32 internal constant _NEXT_STRATEGY_TIMESTAMP_SLOT = 0x5d2b24811886ad126f78c499d71a932a5435795e4f2f6552f0900f12d663cdcf;
     bytes32 internal constant _PAUSED_SLOT = 0xf1cf856d03630b74791fc293cfafd739932a5a075b02d357fb7a726a38777930;
+    bytes32 internal constant _PAUSE_DEPOSIT_WITHDRAW_SLOT = 0x3f72ab3c4fd7071b569b90019790534fd9d9f7f02a74958820fcb1acfa1a06e3;
+    bytes32 internal constant _PAUSE_HARVEST_SLOT = 0xee592aedc0ae16e765518b8591f7c6ffd8be9b46cf1c406052447843d779bdd2;
+    bytes32 internal constant _PAUSE_REBALANCE_SLOT = 0x75bbc389a400e4546266e7cb822123a1210b5b347e7f12825b150bce03faac48;
+    bytes32 internal constant _WITHDRAW_ONLY_SLOT = 0x993b7284bbc317d2c4e58737be79a13224fb4590f4784dc65f708a6b06536083;
+    bytes32 internal constant _REBALANCE_DEVIATION_SLOT = 0xef14df50012225a4f04edea124bcd8271c46dcca17ab80e5f8f189e352fa097a;
+    bytes32 internal constant _REBALANCE_COOLDOWN_SLOT = 0xd18f22707e82220d6b5763ef48685930876ed861e77af969d83d53007e049af9;
+    bytes32 internal constant _MAX_SWAP_BPS_SLOT = 0xd5146288587da7b6f006dede902bb072792f38b43dc8087c535e1fa01cb5853f;
+    bytes32 internal constant _MAX_SLIPPAGE_BPS_SLOT = 0x4c3b76c5a19b7e82d1c1e3565e09710c0d1d6b08ce26e87743ecf8240fdc1648;
+    bytes32 internal constant _LAST_REBALANCE_SLOT = 0xc01523b1993da77bac70e4290d16fbe3749b89eb5d09cad45d3d604ffc2222b1;
+    bytes32 internal constant _REBALANCE_EXECUTOR_SLOT = 0x2b03419b0a75317010c2c9c6753d475bd595f74113c0ba88f0af572c718b3fda;
+    bytes32 internal constant _TWAP_WINDOW_SLOT = 0xb351ae05ae10d5bcedebbac9ca4014101410963769b43b301c05b9cd2b936d5b;
+    bytes32 internal constant _MAX_TWAP_DEVIATION_BPS_SLOT = 0x31e4bc3647d99afb987b97b83a1c0805182f1403f11a680187568d4d4fee90a9;
+    bytes32 internal constant _REBALANCE_HELPER_SLOT = 0xc4bb7b92a9151b8c467244de8874ed194e8140720587f426b16d1d225e0e5284;
 
     /**
      * @dev Storage slot with the address of the current implementation.
@@ -46,6 +59,19 @@ contract CLVaultStorage is Initializable {
         assert(_NEXT_STRATEGY_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.nextStrategy")) - 1));
         assert(_NEXT_STRATEGY_TIMESTAMP_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.nextStrategyTimestamp")) - 1));
         assert(_PAUSED_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.paused")) - 1));
+        assert(_PAUSE_DEPOSIT_WITHDRAW_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.pauseDepositWithdraw")) - 1));
+        assert(_PAUSE_HARVEST_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.pauseHarvest")) - 1));
+        assert(_PAUSE_REBALANCE_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.pauseRebalance")) - 1));
+        assert(_WITHDRAW_ONLY_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.withdrawOnly")) - 1));
+        assert(_REBALANCE_DEVIATION_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.rebalanceDeviation")) - 1));
+        assert(_REBALANCE_COOLDOWN_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.rebalanceCooldown")) - 1));
+        assert(_MAX_SWAP_BPS_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.maxSwapBps")) - 1));
+        assert(_MAX_SLIPPAGE_BPS_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.maxSlippageBps")) - 1));
+        assert(_LAST_REBALANCE_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.lastRebalance")) - 1));
+        assert(_REBALANCE_EXECUTOR_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.rebalanceExecutor")) - 1));
+        assert(_TWAP_WINDOW_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.twapWindow")) - 1));
+        assert(_MAX_TWAP_DEVIATION_BPS_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.maxTwapDeviationBps")) - 1));
+        assert(_REBALANCE_HELPER_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.rebalanceHelper")) - 1));
     }
 
     function initialize(
@@ -61,6 +87,19 @@ contract CLVaultStorage is Initializable {
         _setUnderlyingUnit(1e18);
         _setNextStrategyTimestamp(0);
         _setNextStrategy(address(0));
+        _setPauseDepositWithdraw(false);
+        _setPauseHarvest(false);
+        _setPauseRebalance(false);
+        _setWithdrawOnly(false);
+        _setRebalanceDeviation(0);
+        _setRebalanceCooldown(0);
+        _setMaxSwapBps(2_500);
+        _setMaxSlippageBps(100);
+        _setLastRebalance(0);
+        _setRebalanceExecutor(address(0));
+        _setTwapWindow(900);
+        _setMaxTwapDeviationBps(200);
+        _setRebalanceHelper(address(0));
     }
 
     function _setStrategy(address _address) internal {
@@ -193,6 +232,110 @@ contract CLVaultStorage is Initializable {
 
     function _setPaused(bool _value) internal {
         setBoolean(_PAUSED_SLOT, _value);
+    }
+
+    function _pauseDepositWithdraw() internal view returns (bool) {
+        return getBoolean(_PAUSE_DEPOSIT_WITHDRAW_SLOT);
+    }
+
+    function _setPauseDepositWithdraw(bool _value) internal {
+        setBoolean(_PAUSE_DEPOSIT_WITHDRAW_SLOT, _value);
+    }
+
+    function _pauseHarvest() internal view returns (bool) {
+        return getBoolean(_PAUSE_HARVEST_SLOT);
+    }
+
+    function _setPauseHarvest(bool _value) internal {
+        setBoolean(_PAUSE_HARVEST_SLOT, _value);
+    }
+
+    function _pauseRebalance() internal view returns (bool) {
+        return getBoolean(_PAUSE_REBALANCE_SLOT);
+    }
+
+    function _setPauseRebalance(bool _value) internal {
+        setBoolean(_PAUSE_REBALANCE_SLOT, _value);
+    }
+
+    function _withdrawOnly() internal view returns (bool) {
+        return getBoolean(_WITHDRAW_ONLY_SLOT);
+    }
+
+    function _setWithdrawOnly(bool _value) internal {
+        setBoolean(_WITHDRAW_ONLY_SLOT, _value);
+    }
+
+    function _rebalanceDeviation() internal view returns (uint256) {
+        return getUint256(_REBALANCE_DEVIATION_SLOT);
+    }
+
+    function _setRebalanceDeviation(uint256 _value) internal {
+        setUint256(_REBALANCE_DEVIATION_SLOT, _value);
+    }
+
+    function _rebalanceCooldown() internal view returns (uint256) {
+        return getUint256(_REBALANCE_COOLDOWN_SLOT);
+    }
+
+    function _setRebalanceCooldown(uint256 _value) internal {
+        setUint256(_REBALANCE_COOLDOWN_SLOT, _value);
+    }
+
+    function _maxSwapBps() internal view returns (uint256) {
+        return getUint256(_MAX_SWAP_BPS_SLOT);
+    }
+
+    function _setMaxSwapBps(uint256 _value) internal {
+        setUint256(_MAX_SWAP_BPS_SLOT, _value);
+    }
+
+    function _maxSlippageBps() internal view returns (uint256) {
+        return getUint256(_MAX_SLIPPAGE_BPS_SLOT);
+    }
+
+    function _setMaxSlippageBps(uint256 _value) internal {
+        setUint256(_MAX_SLIPPAGE_BPS_SLOT, _value);
+    }
+
+    function _lastRebalance() internal view returns (uint256) {
+        return getUint256(_LAST_REBALANCE_SLOT);
+    }
+
+    function _setLastRebalance(uint256 _value) internal {
+        setUint256(_LAST_REBALANCE_SLOT, _value);
+    }
+
+    function _rebalanceExecutor() internal view returns (address) {
+        return getAddress(_REBALANCE_EXECUTOR_SLOT);
+    }
+
+    function _setRebalanceExecutor(address _value) internal {
+        setAddress(_REBALANCE_EXECUTOR_SLOT, _value);
+    }
+
+    function _twapWindow() internal view returns (uint32) {
+        return uint32(getUint256(_TWAP_WINDOW_SLOT));
+    }
+
+    function _setTwapWindow(uint32 _value) internal {
+        setUint256(_TWAP_WINDOW_SLOT, uint256(_value));
+    }
+
+    function _maxTwapDeviationBps() internal view returns (uint256) {
+        return getUint256(_MAX_TWAP_DEVIATION_BPS_SLOT);
+    }
+
+    function _setMaxTwapDeviationBps(uint256 _value) internal {
+        setUint256(_MAX_TWAP_DEVIATION_BPS_SLOT, _value);
+    }
+
+    function _rebalanceHelper() internal view returns (address) {
+        return getAddress(_REBALANCE_HELPER_SLOT);
+    }
+
+    function _setRebalanceHelper(address _value) internal {
+        setAddress(_REBALANCE_HELPER_SLOT, _value);
     }
 
     function setBoolean(bytes32 slot, bool _value) internal {

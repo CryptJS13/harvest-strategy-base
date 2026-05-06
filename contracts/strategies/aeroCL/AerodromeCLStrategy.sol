@@ -7,7 +7,6 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC721/utils/ERC721HolderUpgradeable.sol";
 import "../../base/interface/IUniversalLiquidator.sol";
-import "../../base/interface/ICLVault.sol";
 import "../../base/upgradability/BaseUpgradeableStrategyCL.sol";
 import "../../base/interface/aerodrome/ICLGauge.sol";
 import "../../base/interface/concentrated-liquidity/INonfungiblePositionManager.sol";
@@ -21,6 +20,16 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
 
   // this would be reset on each upgrade
   address[] public rewardTokens;
+  mapping(address => bool) public rewardTokenAllowed;
+  bool public harvestPaused;
+  bool public withdrawOnlyMode;
+  uint256 public maxSlippageBps;
+  mapping(address => uint256) public minRewardToCompound;
+  uint256 private constant _BPS_DENOMINATOR = 10_000;
+  event EmergencyStateUpdated(bool pauseInvesting, bool pauseHarvesting, bool withdrawOnly);
+  event StrategySwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, uint256 minOut);
+  event StrategySwapSkipped(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 minOut);
+  event MinRewardToCompoundUpdated(address indexed token, uint256 threshold);
 
   constructor() BaseUpgradeableStrategyCL() {
   }
@@ -39,6 +48,9 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
       _rewardToken,
       harvestMSIG
     );
+    maxSlippageBps = 100;
+    rewardTokenAllowed[_rewardToken] = true;
+    minRewardToCompound[_rewardToken] = 1;
   }
 
   function _nftStaked() internal view returns (bool staked) {
@@ -80,6 +92,9 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
   function emergencyExit() public onlyGovernance {
     _emergencyExitRewardPool();
     _setPausedInvesting(true);
+    harvestPaused = true;
+    withdrawOnlyMode = true;
+    emit EmergencyStateUpdated(true, true, true);
   }
 
   /*
@@ -87,17 +102,47 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
   */
   function continueInvesting() public onlyGovernance {
     _setPausedInvesting(false);
+    harvestPaused = false;
+    withdrawOnlyMode = false;
+    emit EmergencyStateUpdated(false, false, false);
   }
 
   function unsalvagableTokens(address token) public view returns (bool) {
-    return (token == rewardToken());
+    return (token == rewardToken() || token == token0() || token == token1() || rewardTokenAllowed[token]);
   }
 
   function addRewardToken(address _token) public onlyGovernance {
+    require(_token != address(0), "token");
+    require(!rewardTokenAllowed[_token], "already allowed");
+    rewardTokenAllowed[_token] = true;
     rewardTokens.push(_token);
   }
 
+  function removeRewardToken(address _token) external onlyGovernance {
+    require(_token != rewardToken(), "base reward");
+    rewardTokenAllowed[_token] = false;
+  }
+
+  function setMaxSlippageBps(uint256 _maxSlippageBps) external onlyGovernance {
+    require(_maxSlippageBps <= _BPS_DENOMINATOR, "slippage");
+    maxSlippageBps = _maxSlippageBps;
+  }
+
+  function setEmergencyState(bool _pauseInvesting, bool _pauseHarvesting, bool _withdrawOnly) external onlyGovernance {
+    _setPausedInvesting(_pauseInvesting);
+    harvestPaused = _pauseHarvesting;
+    withdrawOnlyMode = _withdrawOnly;
+    emit EmergencyStateUpdated(_pauseInvesting, _pauseHarvesting, _withdrawOnly);
+  }
+
+  function setMinRewardToCompound(address _token, uint256 _threshold) external onlyGovernance {
+    require(_token != address(0), "token");
+    minRewardToCompound[_token] = _threshold;
+    emit MinRewardToCompoundUpdated(_token, _threshold);
+  }
+
   function _liquidateReward() internal {
+    require(!withdrawOnlyMode, "Withdraw only");
     if (!sell()) {
       // Profits can be disabled for possible simplified and rapid exit
       emit ProfitsNotCollected(sell(), false);
@@ -105,17 +150,22 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
     }
 
     address _rewardToken = rewardToken();
-    address _universalLiquidator = universalLiquidator();
     for(uint256 i = 0; i < rewardTokens.length; i++){
       address token = rewardTokens[i];
       uint256 balance = IERC20(token).balanceOf(address(this));
       if (balance == 0) {
         continue;
       }
+      if (!rewardTokenAllowed[token]) {
+        emit StrategySwapSkipped(token, _rewardToken, balance, 0);
+        continue;
+      }
+      if (balance < minRewardToCompound[token]) {
+        emit StrategySwapSkipped(token, _rewardToken, balance, _boundedMinOutFromIn(balance));
+        continue;
+      }
       if (token != _rewardToken){
-        IERC20(token).safeApprove(_universalLiquidator, 0);
-        IERC20(token).safeApprove(_universalLiquidator, balance);
-        IUniversalLiquidator(_universalLiquidator).swap(token, _rewardToken, balance, 1, address(this));
+        _swapWithBound(token, _rewardToken, balance, _boundedMinOutFromIn(balance));
       }
     }
 
@@ -126,38 +176,45 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
     if (remainingRewardBalance < 1e12) {
       return;
     }
+    if (remainingRewardBalance < minRewardToCompound[_rewardToken]) {
+      return;
+    }
 
     address _token0 = token0();
     address _token1 = token1();
 
-    (uint256 token0Weight ,uint256 token1Weight) = ICLVault(vault()).getCurrentTokenWeights();
-
     if (_token0 != _rewardToken) {
-      IERC20(_rewardToken).safeApprove(_universalLiquidator, 0);
-      IERC20(_rewardToken).safeApprove(_universalLiquidator, remainingRewardBalance);
-      IUniversalLiquidator(_universalLiquidator).swap(_rewardToken, _token0, remainingRewardBalance, 1, address(this));
+      bool rewardSwapOk = _swapWithBound(_rewardToken, _token0, remainingRewardBalance, _boundedMinOutFromIn(remainingRewardBalance));
+      if (!rewardSwapOk) {
+        // Keep rewards in strategy and retry compounding once enough value accrues.
+        return;
+      }
     }
 
     uint256 token0Balance = IERC20(token0()).balanceOf(address(this));
     uint256 token1Balance = IERC20(token1()).balanceOf(address(this));
-    (uint256 currentWeight0, uint256 currentWeight1) = _getBalanceWeights(token0Balance, token1Balance);
-
-    if (currentWeight0 < token0Weight) {
-      uint256 toToken0 = token1Balance.mul(token0Weight.sub(currentWeight0)).div(1e18);
-      if (toToken0 > token1Balance) {
-        toToken0 = token1Balance;
+    if (token0Balance > token1Balance) {
+      uint256 toToken1 = token0Balance.sub(token1Balance).div(2);
+      if (toToken1 > 0) {
+        if (toToken1 < minRewardToCompound[_token0]) {
+          return;
+        }
+        bool rebalanceOk = _swapWithBound(_token0, _token1, toToken1, _boundedMinOutFromIn(toToken1));
+        if (!rebalanceOk) {
+          return;
+        }
       }
-      IERC20(_token1).safeApprove(_universalLiquidator, 0);
-      IERC20(_token1).safeApprove(_universalLiquidator, toToken0);
-      IUniversalLiquidator(_universalLiquidator).swap(_token1, _token0, toToken0, 1, address(this));
-    } else if (currentWeight1 < token1Weight) {
-      uint256 toToken1 = token0Balance.mul(token1Weight.sub(currentWeight1)).div(1e18);
-      if (toToken1 > token0Balance) {
-        toToken1 = token0Balance;
+    } else if (token1Balance > token0Balance) {
+      uint256 toToken0 = token1Balance.sub(token0Balance).div(2);
+      if (toToken0 > 0) {
+        if (toToken0 < minRewardToCompound[_token1]) {
+          return;
+        }
+        bool rebalanceOk = _swapWithBound(_token1, _token0, toToken0, _boundedMinOutFromIn(toToken0));
+        if (!rebalanceOk) {
+          return;
+        }
       }
-      IERC20(_token0).safeApprove(_universalLiquidator, 0);
-      IERC20(_token0).safeApprove(_universalLiquidator, toToken1);
-      IUniversalLiquidator(_universalLiquidator).swap(_token0, _token1, toToken1, 1, address(this));
     }
 
     token0Balance = IERC20(_token0).balanceOf(address(this));
@@ -182,21 +239,6 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
       })
     );
   }
-
-  function _getBalanceWeights(uint256 token0Balance, uint256 token1Balance) internal view returns (uint256, uint256) {
-    uint256 sqrtPrice = uint256(ICLVault(vault()).getSqrtPriceX96());
-    uint256 price0In1 = sqrtPrice.mul(sqrtPrice).mul(1e18).div(uint(2**(96 * 2)));
-    uint256 totalBalanceIn1 = token0Balance.mul(price0In1).div(1e18).add(token1Balance);
-    uint256 currentWeight0 = token0Balance.mul(price0In1).div(totalBalanceIn1);
-    uint256 currentWeight1 = token1Balance.mul(1e18).div(totalBalanceIn1);
-    uint256 totalWeight = currentWeight0.add(currentWeight1);
-    if (totalWeight != 1e18) {
-      currentWeight0 = currentWeight0.mul(1e18).div(totalWeight);
-      currentWeight1 = uint256(1e18).sub(currentWeight0);
-    }
-    return (currentWeight0, currentWeight1);
-  }
-
 
   /*
   *   Withdraws all the asset to the vault
@@ -230,6 +272,8 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
   *   when the investing is being paused by governance.
   */
   function doHardWork() external onlyNotPausedInvesting restricted {
+    require(!harvestPaused, "Harvest paused");
+    require(!withdrawOnlyMode, "Withdraw only");
     _withdraw();
     _liquidateReward();
     _investAllUnderlying();
@@ -253,5 +297,37 @@ contract AerodromeCLStrategy is BaseUpgradeableStrategyCL, ERC721HolderUpgradeab
 
   function finalizeUpgrade() external virtual onlyGovernance {
     _finalizeUpgrade();
+  }
+
+  function _boundedMinOutFromIn(uint256 amountIn) internal pure returns (uint256) {
+    amountIn;
+    return 1;
+  }
+
+  function _swapWithBound(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) internal returns (bool) {
+    address _universalLiquidator = universalLiquidator();
+    IERC20(tokenIn).safeApprove(_universalLiquidator, 0);
+    IERC20(tokenIn).safeApprove(_universalLiquidator, amountIn);
+    (bool success, bytes memory returnData) = _universalLiquidator.call(
+      abi.encodeWithSelector(
+        IUniversalLiquidator.swap.selector,
+        tokenIn,
+        tokenOut,
+        amountIn,
+        minOut,
+        address(this)
+      )
+    );
+    if (!success || returnData.length < 32) {
+      emit StrategySwapSkipped(tokenIn, tokenOut, amountIn, minOut);
+      return false;
+    }
+    uint256 amountOut = abi.decode(returnData, (uint256));
+    if (amountOut == 0 || amountOut < minOut) {
+      emit StrategySwapSkipped(tokenIn, tokenOut, amountIn, minOut);
+      return false;
+    }
+    emit StrategySwapExecuted(tokenIn, tokenOut, amountIn, amountOut, minOut);
+    return true;
   }
 }
