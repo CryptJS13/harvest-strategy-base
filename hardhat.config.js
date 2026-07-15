@@ -2,6 +2,23 @@ if (typeof File === "undefined") {
   global.File = class File {};
 }
 
+// Inject a root-level beforeAll into mocha so we mine one block before any
+// test runs against a fork. Avoids EDR's "No known hardfork for execution on
+// historical block N" error on Base when reading state at the fork block.
+{
+  const Mocha = require("mocha");
+  const origRun = Mocha.prototype.run;
+  Mocha.prototype.run = function (...args) {
+    this.suite.beforeAll("hh-fork-mine-once", async function () {
+      const hre = require("hardhat");
+      if (hre.network.name !== "hardhat") return;
+      if (!hre.network.config.forking || hre.network.config.forking.enabled === false) return;
+      await hre.network.provider.request({ method: "evm_mine", params: [] });
+    });
+    return origRun.apply(this, args);
+  };
+}
+
 require("@nomicfoundation/hardhat-verify");
 require("@nomiclabs/hardhat-truffle5");
 require("@nomiclabs/hardhat-web3");
@@ -88,7 +105,7 @@ module.exports = {
     },
   },
   mocha: {
-    timeout: 2000000
+    timeout: 2000000,
   },
   etherscan: {
     apiKey: process.env.BASESCAN_API_KEY,

@@ -193,7 +193,12 @@ describe("CL stress fuzz (fork)", function() {
       const t1Tiny = bn(await token1.balanceOf(governance)).sub(t1BeforeTiny);
       await token0.approve(vault.address, t0Tiny.toString(), { from: governance });
       await token1.approve(vault.address, t1Tiny.toString(), { from: governance });
-      await vault.deposit(t0Tiny.toString(), t1Tiny.toString(), 0, governance, { from: governance });
+      try {
+        await vault.deposit(t0Tiny.toString(), t1Tiny.toString(), 0, governance, { from: governance });
+      } catch (e) {
+        // dust amounts may round to zero shares — vault rejects with ErrZeroShares
+        if (!String(e.message || e).includes("ErrZeroShares")) throw e;
+      }
 
       const sharesMid = bn(await vault.balanceOf(governance));
       const nearFull = sharesMid.mul(bn("97")).div(bn("100"));

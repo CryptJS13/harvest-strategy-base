@@ -1,5 +1,7 @@
-const IPosManager = artifacts.require("INonfungiblePositionManager");
-const ICLGauge = artifacts.require("ICLGauge");
+// Resolved lazily inside validateCLVaultWiring so this module can be `require`d outside the
+// Hardhat runner context (e.g. by tools that introspect deploy configs).
+let IPosManager;
+let ICLGauge;
 
 function slotFromLabel(label) {
   const raw = web3.utils.toBN(web3.utils.keccak256(label));
@@ -25,6 +27,8 @@ async function validateCLVaultWiring({
   deployer,
   expected = {},
 }) {
+  if (!IPosManager) IPosManager = artifacts.require("INonfungiblePositionManager");
+  if (!ICLGauge) ICLGauge = artifacts.require("ICLGauge");
   const pm = await IPosManager.at(posManager);
   const owner = await pm.ownerOf(posId);
   if (owner.toLowerCase() !== vault.address.toLowerCase()) {

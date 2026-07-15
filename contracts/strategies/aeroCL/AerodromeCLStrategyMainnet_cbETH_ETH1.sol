@@ -24,7 +24,6 @@ contract AerodromeCLStrategyMainnet_cbETH_ETH1 is AerodromeCLStrategy {
 
   function finalizeUpgrade() external override onlyGovernance {
     _finalizeUpgrade();
-    address aero = address(0x940181a94A35A4569E4529A3CDfB74e38FD98631);
-    rewardTokens = [aero];
+    _reseedRewardTokens(address(0x940181a94A35A4569E4529A3CDfB74e38FD98631)); // AERO
   }
 }

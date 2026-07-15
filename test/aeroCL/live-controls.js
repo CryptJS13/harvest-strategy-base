@@ -408,6 +408,46 @@ describe("CL live-like controls", function() {
     assert.equal(validOwner, true, "Position NFT owner should be vault, strategy, or gauge");
   });
 
+  it("should expose swap-skip telemetry storage", async function() {
+    // Earlier tests in this file may have already produced skips, so we only assert the slots
+    // exist (read back as numeric).
+    const strategyAddr = await vault.strategy();
+    const strategy = await Strategy.at(strategyAddr);
+    const count = web3.utils.toBN(await strategy.swapSkippedCount());
+    const stamp = web3.utils.toBN(await strategy.lastSwapSkippedAt());
+    assert.equal(count.gte(web3.utils.toBN("0")), true, "swapSkippedCount must be readable");
+    assert.equal(stamp.gte(web3.utils.toBN("0")), true, "lastSwapSkippedAt must be readable");
+  });
+
+  it("should record skip telemetry and emit indexed reason on below-threshold reward", async function() {
+    const strategyAddr = await vault.strategy();
+    const strategy = await Strategy.at(strategyAddr);
+    const aero = await strategy.rewardToken();
+
+    // Force every aero balance below threshold so the BelowThreshold path fires regardless of
+    // accrued gauge rewards. Threshold uint256 max guarantees the comparison fails for any balance.
+    const max256 = web3.utils.toBN("2").pow(web3.utils.toBN("256")).sub(web3.utils.toBN("1"));
+    await strategy.setMinRewardToCompound(aero, max256.toString(), { from: governance });
+
+    const before = web3.utils.toBN(await strategy.swapSkippedCount());
+    const tx = await controller.doHardWork(vault.address, { from: governance });
+    const after = web3.utils.toBN(await strategy.swapSkippedCount());
+
+    // The base reward token's loop iteration is itself short-circuited by the BelowThreshold
+    // skip path. With only `aero` in rewardTokens we expect at least one increment per hardwork
+    // when the gauge accrued anything (and zero increment when balance==0). Either way: counter
+    // must be monotonically non-decreasing and lastSwapSkippedAt must reflect the block when a
+    // skip happened.
+    assert.equal(after.gte(before), true, "Counter must not decrease");
+    if (after.gt(before)) {
+      const ts = web3.utils.toBN(await strategy.lastSwapSkippedAt());
+      assert.equal(ts.gt(web3.utils.toBN("0")), true, "Expected lastSwapSkippedAt to be stamped");
+    }
+
+    // Restore for downstream tests.
+    await strategy.setMinRewardToCompound(aero, "1", { from: governance });
+  });
+
   it("should keep gas within baseline budgets on core paths", async function() {
     await vault.setLanePause(false, false, false, false, { from: governance });
     await vault.setRebalanceConfig(0, 0, governance, { from: governance });

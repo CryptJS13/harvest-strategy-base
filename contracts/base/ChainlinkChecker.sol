@@ -50,17 +50,18 @@ contract ChainlinkChecker is Controllable, AutomationCompatibleInterface {
         }
     }
 
-    // If the return value is MAX_UINT256, it means that
-    // the specified vault is not in the list
+    /// @dev Reverts with UnknownVault if `v` is not registered.
     function getVaultIndex(address v) public view returns(uint256) {
-        for (uint256 i = 0; i < vaults.length; i++) {
+        uint256 n = vaults.length;
+        for (uint256 i = 0; i < n; i++) {
             if (vaults[i] == v) return i;
         }
         revert UnknownVault(v);
     }
 
     function _checker() internal view returns (bool canExec, bytes memory execPayload) {
-        for (uint256 i = 0; i < vaults.length; i++) {
+        uint256 n = vaults.length;
+        for (uint256 i = 0; i < n; i++) {
             (canExec, execPayload) = ICLVault(vaults[i]).checker();
             if (canExec) return(true, execPayload);
         }

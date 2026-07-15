@@ -1,0 +1,18 @@
+{
+  "name": "pilot-cbeth-eth-recovery",
+  "addressesPath": "test/test-config.js",
+  "strategyName": "AerodromeCLStrategyMainnet_cbETH_ETH1",
+  "recovery": {
+    "vault": "0xF1d5630B646E2D3AfC1fC31F057df349620F48eC",
+    "strategy": "0x33C1bC4E11fD75be8f73304cb4a77AbD5BEbd7cf",
+    "strategyImpl": "0x6e386eCA6EB9faE44e0ae2a20BcCeEe627ad9E6a",
+    "helper": "0xfE3f01311f6798889829c2816C4a9A4B01bE8288"
+  },
+  "strategy": {
+    "minRewardToCompound": "10000000000000000",
+    "rewardToken": "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
+  },
+  "wrappers": { "deploy": true },
+  "verify": true,
+  "snapshotPath": "scripts/deployments/cl/pilot-cbeth-eth.json"
+}

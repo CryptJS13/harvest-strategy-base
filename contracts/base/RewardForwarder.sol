@@ -9,7 +9,6 @@ import "./inheritance/Governable.sol";
 import "./interface/IController.sol";
 import "./interface/IRewardForwarder.sol";
 import "./interface/IProfitSharingReceiver.sol";
-import "./interface/IStrategy.sol";
 import "./interface/IUniversalLiquidator.sol";
 import "./inheritance/Controllable.sol";
 

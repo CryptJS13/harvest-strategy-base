@@ -20,7 +20,6 @@ contract CLVaultStorage is Initializable {
     bytes32 internal constant _NEXT_IMPLEMENTATION_TIMESTAMP_SLOT = 0x3bc747f4b148b37be485de3223c90b4468252967d2ea7f9fcbd8b6e653f434c9;
     bytes32 internal constant _NEXT_STRATEGY_SLOT = 0xcd7bd9250b0e02f3b13eccf8c73ef5543cb618e0004628f9ca53b65fbdbde2d0;
     bytes32 internal constant _NEXT_STRATEGY_TIMESTAMP_SLOT = 0x5d2b24811886ad126f78c499d71a932a5435795e4f2f6552f0900f12d663cdcf;
-    bytes32 internal constant _PAUSED_SLOT = 0xf1cf856d03630b74791fc293cfafd739932a5a075b02d357fb7a726a38777930;
     bytes32 internal constant _PAUSE_DEPOSIT_WITHDRAW_SLOT = 0x3f72ab3c4fd7071b569b90019790534fd9d9f7f02a74958820fcb1acfa1a06e3;
     bytes32 internal constant _PAUSE_HARVEST_SLOT = 0xee592aedc0ae16e765518b8591f7c6ffd8be9b46cf1c406052447843d779bdd2;
     bytes32 internal constant _PAUSE_REBALANCE_SLOT = 0x75bbc389a400e4546266e7cb822123a1210b5b347e7f12825b150bce03faac48;
@@ -34,13 +33,6 @@ contract CLVaultStorage is Initializable {
     bytes32 internal constant _TWAP_WINDOW_SLOT = 0xb351ae05ae10d5bcedebbac9ca4014101410963769b43b301c05b9cd2b936d5b;
     bytes32 internal constant _MAX_TWAP_DEVIATION_BPS_SLOT = 0x31e4bc3647d99afb987b97b83a1c0805182f1403f11a680187568d4d4fee90a9;
     bytes32 internal constant _REBALANCE_HELPER_SLOT = 0xc4bb7b92a9151b8c467244de8874ed194e8140720587f426b16d1d225e0e5284;
-
-    /**
-     * @dev Storage slot with the address of the current implementation.
-     * This is the keccak-256 hash of "eip1967.proxy.implementation" subtracted by 1, and is
-     * validated in the constructor.
-     */
-    bytes32 internal constant _IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
 
     constructor() {
         assert(_STRATEGY_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.strategy")) - 1));
@@ -58,7 +50,6 @@ contract CLVaultStorage is Initializable {
         assert(_NEXT_IMPLEMENTATION_TIMESTAMP_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.nextImplementationTimestamp")) - 1));
         assert(_NEXT_STRATEGY_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.nextStrategy")) - 1));
         assert(_NEXT_STRATEGY_TIMESTAMP_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.nextStrategyTimestamp")) - 1));
-        assert(_PAUSED_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.paused")) - 1));
         assert(_PAUSE_DEPOSIT_WITHDRAW_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.pauseDepositWithdraw")) - 1));
         assert(_PAUSE_HARVEST_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.pauseHarvest")) - 1));
         assert(_PAUSE_REBALANCE_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.pauseRebalance")) - 1));
@@ -85,21 +76,13 @@ contract CLVaultStorage is Initializable {
         _setPosWidth(__posWidth);
         _setTargetWidth(__targetWidth);
         _setUnderlyingUnit(1e18);
-        _setNextStrategyTimestamp(0);
-        _setNextStrategy(address(0));
-        _setPauseDepositWithdraw(false);
-        _setPauseHarvest(false);
-        _setPauseRebalance(false);
-        _setWithdrawOnly(false);
-        _setRebalanceDeviation(0);
-        _setRebalanceCooldown(0);
+        // Non-zero safety defaults only. Zero-valued fields (pause flags, cooldown, deviation,
+        // executor, helper, timestamps) are omitted — a fresh proxy's slots are already zero,
+        // and each of those sstores costs ~2.2k gas for no state change.
         _setMaxSwapBps(2_500);
         _setMaxSlippageBps(100);
-        _setLastRebalance(0);
-        _setRebalanceExecutor(address(0));
         _setTwapWindow(900);
         _setMaxTwapDeviationBps(200);
-        _setRebalanceHelper(address(0));
     }
 
     function _setStrategy(address _address) internal {
@@ -220,18 +203,6 @@ contract CLVaultStorage is Initializable {
 
     function _nextStrategyTimestamp() internal view returns (uint256) {
         return getUint256(_NEXT_STRATEGY_TIMESTAMP_SLOT);
-    }
-
-    function _implementation() internal view returns (address) {
-        return getAddress(_IMPLEMENTATION_SLOT);
-    }
-
-    function _paused() internal view returns (bool) {
-        return getBoolean(_PAUSED_SLOT);
-    }
-
-    function _setPaused(bool _value) internal {
-        setBoolean(_PAUSED_SLOT, _value);
     }
 
     function _pauseDepositWithdraw() internal view returns (bool) {
@@ -367,13 +338,6 @@ contract CLVaultStorage is Initializable {
         }
     }
 
-    function setUint24(bytes32 slot, uint24 _value) internal {
-        // solhint-disable-next-line no-inline-assembly
-        assembly {
-            sstore(slot, _value)
-        }
-    }
-
     function getAddress(bytes32 slot) internal view returns (address str) {
         // solhint-disable-next-line no-inline-assembly
         assembly {
@@ -389,13 +353,6 @@ contract CLVaultStorage is Initializable {
     }
 
     function getInt24(bytes32 slot) internal view returns (int24 str) {
-        // solhint-disable-next-line no-inline-assembly
-        assembly {
-            str := sload(slot)
-        }
-    }
-
-    function getUint24(bytes32 slot) internal view returns (uint24 str) {
         // solhint-disable-next-line no-inline-assembly
         assembly {
             str := sload(slot)
