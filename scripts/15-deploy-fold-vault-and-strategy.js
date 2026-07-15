@@ -22,7 +22,17 @@ async function main() {
 
   console.log("New vault deployed and initialised at", proxy.creates);
 
+  // The fold strategy references the external AaveReserveLib, so the library
+  // must be deployed and linked into the strategy artifact before the
+  // implementation can be instantiated (otherwise .new() throws on the
+  // unresolved library placeholder).
+  const AaveReserveLib = artifacts.require('AaveReserveLib');
+  const lib = await type2Transaction(AaveReserveLib.new);
+  console.log("AaveReserveLib deployed at:", lib.creates);
+  const libInstance = await AaveReserveLib.at(lib.creates);
+
   const StrategyImpl = artifacts.require(strategyName);
+  StrategyImpl.link(libInstance);
   const impl = await type2Transaction(StrategyImpl.new);
 
   console.log("Strategy Implementation deployed at:", impl.creates);
@@ -37,7 +47,11 @@ async function main() {
 
   console.log("Strategy initialized with vault", proxy.creates);
 
-  await hre.run("verify:verify", {address: impl.creates}); 
+  // Pass the linked library so the explorer can match the linked bytecode.
+  await hre.run("verify:verify", {
+    address: impl.creates,
+    libraries: { AaveReserveLib: lib.creates },
+  });
 }
 
 main()

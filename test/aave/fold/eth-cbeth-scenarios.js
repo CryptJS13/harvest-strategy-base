@@ -381,6 +381,7 @@ describe("Aave Fold cbETH-ETH scenario runs", function() {
       existingVaultAddress: null,
       strategyArtifact: Strategy,
       strategyArtifactIsUpgradable: true,
+      libraries: ["AaveReserveLib"],
       underlying,
       governance,
       liquidation: [
