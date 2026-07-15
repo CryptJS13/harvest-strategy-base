@@ -121,6 +121,7 @@ describe("Base Mainnet Aave Fold cbETH-ETH", function() {
       existingVaultAddress: null,
       strategyArtifact: Strategy,
       strategyArtifactIsUpgradable: true,
+      libraries: ["AaveReserveLib"],
       underlying,
       governance,
       liquidation: [

@@ -154,6 +154,27 @@ async function setupCoreProtocol(config) {
 
   let strategyImpl = null;
 
+  // Optional library linking — pass `libraries: ["AaveReserveLib", ...]` (or
+  // an array of {name, instance}) and the helper deploys & links each one
+  // against the strategy artifact before instantiation.
+  if (Array.isArray(config.libraries) && config.libraries.length > 0) {
+    for (const entry of config.libraries) {
+      let libArtifact, libInstance;
+      if (typeof entry === "string") {
+        libArtifact = artifacts.require(entry);
+        libInstance = await libArtifact.new();
+      } else if (entry && entry.instance) {
+        libInstance = entry.instance;
+      } else if (entry && entry.name) {
+        libArtifact = artifacts.require(entry.name);
+        libInstance = await libArtifact.new();
+      } else {
+        throw new Error("setupCoreProtocol.libraries entry must be a string or {name|instance}");
+      }
+      await config.strategyArtifact.link(libInstance);
+    }
+  }
+
   if (!config.strategyArtifactIsUpgradable) {
     strategy = await config.strategyArtifact.new(
       ...config.strategyArgs,
