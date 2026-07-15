@@ -1,36 +1,39 @@
 // SPDX-License-Identifier: Unlicense
 pragma solidity 0.8.26;
 
-import "@openzeppelin/contracts-upgradeable/utils/math/MathUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC721/IERC721Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC721/utils/ERC721HolderUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 import "./interface/IStrategy.sol";
 import "./interface/IController.sol";
 import "./interface/IUpgradeSource.sol";
+import "./interface/IUniversalLiquidator.sol";
+import "./interface/ICLRebalanceHelper.sol";
 import "./inheritance/ControllableInit.sol";
 import "./CLVaultStorage.sol";
 import "./interface/concentrated-liquidity/INonfungiblePositionManager.sol";
-import "./interface/concentrated-liquidity/IFactory.sol";
-import "./interface/concentrated-liquidity/IPool.sol";
-import "./interface/concentrated-liquidity/TickMath.sol";
-import "./interface/concentrated-liquidity/LiquidityAmounts.sol";
-import "./interface/IUniversalLiquidator.sol";
 
 contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, ControllableInit, CLVaultStorage {
   using SafeERC20Upgradeable for IERC20Upgradeable;
-  using AddressUpgradeable for address;
-  using SafeMathUpgradeable for uint256;
 
-  /**
-   * Caller has exchanged assets for shares, and transferred those shares to owner.
-   *
-   * MUST be emitted when tokens are deposited into the Vault via the mint and deposit methods.
-   */
+  uint256 private constant _BPS_DENOMINATOR = 10_000;
+
+  struct WithdrawCache {
+    uint256 supplyBefore;
+    uint256 idleShare0;
+    uint256 idleShare1;
+    uint128 liquidityShare;
+    uint256 received0;
+    uint256 received1;
+    uint256 payout0;
+    uint256 payout1;
+  }
+
+  /// @notice Emitted on every successful two-token deposit. `shares` is the amount minted to
+  /// `receiver`; `amount0`/`amount1` are the caller-supplied desired amounts (leftover beyond
+  /// what the position consumed is returned to the receiver in the same transaction).
   event Deposit(
       address indexed sender,
       address indexed receiver,
@@ -39,11 +42,8 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
       uint256 shares
   );
 
-  /**
-   * Caller has exchanged shares, owned by owner, for assets, and transferred those assets to receiver.
-   *
-   * MUST be emitted when shares are withdrawn from the Vault in ERC4626.redeem or ERC4626.withdraw methods.
-   */
+  /// @notice Emitted on every successful withdraw. `amount0`/`amount1` are the actual payouts
+  /// (proportional position liquidity plus the withdrawer's share of any idle balances).
   event Withdraw(
       address indexed sender,
       address indexed receiver,
@@ -61,10 +61,33 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
       uint256 newLiquidity,
       uint256 timestamp
   );
+  event LanePauseUpdated(bool pauseDepositWithdraw, bool pauseHarvest, bool pauseRebalance, bool withdrawOnly);
+  event RebalanceConfigUpdated(
+    uint256 deviation,
+    uint256 cooldown,
+    address executor
+  );
+  event RebalanceSafetyConfigUpdated(uint256 maxSwapBps, uint256 maxSlippageBps, uint32 twapWindow, uint256 maxTwapDeviationBps);
+  event RebalanceHelperUpdated(address helper);
+  event HarvestExecuted(uint256 timestamp, address indexed caller);
 
+  error ErrTargetWidth();
+  error ErrStrategyUndefined();
+  error ErrNotRebalanceExecutor();
+  error ErrDepositWithdrawPaused();
+  error ErrHarvestPaused();
+  error ErrRebalancePaused();
+  error ErrWithdrawOnly();
+  error ErrTimelock();
+  error ErrVault();
+  error ErrZeroAddress();
+  error ErrPositionNotInVault();
+  error ErrSlippage();
+  error ErrTotalSupply();
+  error ErrZeroShares();
+  error ErrRebalanceCooldown();
+  error ErrProtectedToken();
 
-  constructor() {
-  }
 
   // the function is name differently to not cause inheritance clash in truffle and allows tests
   function initializeVault(
@@ -86,8 +109,8 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
       uint256 _initialLiquidity,
     ,,,) = INonfungiblePositionManager(_posManager).positions(_posId);
 
-    uint256 positionWidth = uint256(int256(_tickUpper) - int256(_tickLower)).div(uint256(uint24(_tickSpacing)));
-    require (_targetWidth <= positionWidth, "Target");
+    uint256 positionWidth = uint256(int256(_tickUpper) - int256(_tickLower)) / uint256(uint24(_tickSpacing));
+    if (!(_targetWidth <= positionWidth)) revert ErrTargetWidth();
 
     CLVaultStorage.initialize(_posId, _posManager, positionWidth, _targetWidth);
 
@@ -129,11 +152,6 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
     return _targetWidth();
   }
 
-  function setTargetWidth(uint256 _target) external onlyGovernance {
-    require(_target <= _posWidth());
-    _setTargetWidth(_target);
-  }
-
   function tickLower() external view returns(int24) {
     return _tickLower();
   }
@@ -142,35 +160,42 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
     return _tickUpper();
   }
 
-  function underlyingUnit() external view returns(uint256) {
-    return _underlyingUnit();
+  function tickSpacing() external view returns(int24) {
+    return _tickSpacing();
   }
 
-  function nextImplementation() external view returns(address) {
-    return _nextImplementation();
-  }
-
-  function nextImplementationTimestamp() external view returns(uint256) {
-    return _nextImplementationTimestamp();
-  }
-
-  function nextImplementationDelay() public view returns (uint256) {
+  function _nextImplementationDelay() internal view returns (uint256) {
     return IController(controller()).nextImplementationDelay();
   }
 
   modifier whenStrategyDefined() {
-    require(address(_strategy()) != address(0));
+    if (!(address(_strategy()) != address(0))) revert ErrStrategyUndefined();
     _;
   }
 
-  // Only smart contracts will be affected by this modifier
-  modifier defense() {
-    require(
-      (msg.sender == tx.origin) ||                // If it is a normal user and not smart contract,
-                                                  // then the requirement will pass
-      !IController(controller()).greyList(msg.sender), // If it is a smart contract, then
-      "grey list"  // make sure that it is not on our greyList.
-    );
+  modifier onlyRebalanceExecutor() {
+    if (
+      !(
+        msg.sender == governance() ||
+        msg.sender == controller() ||
+        msg.sender == _rebalanceExecutor()
+      )
+    ) revert ErrNotRebalanceExecutor();
+    _;
+  }
+
+  modifier whenDepositWithdrawEnabled() {
+    if (_pauseDepositWithdraw()) revert ErrDepositWithdrawPaused();
+    _;
+  }
+
+  modifier whenHarvestEnabled() {
+    if (_pauseHarvest()) revert ErrHarvestPaused();
+    _;
+  }
+
+  modifier whenRebalanceEnabled() {
+    if (_pauseRebalance()) revert ErrRebalancePaused();
     _;
   }
 
@@ -178,50 +203,51 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
   * Chooses the best strategy and re-invests. If the strategy did not change, it just calls
   * doHardWork on the current strategy. Call this through controller to claim hard rewards.
   */
-  function doHardWork() nonReentrant whenStrategyDefined onlyControllerOrGovernance external {
-    if (_shouldRebalance()) {
-      rebalanceCurrentTick(_posWidth());
+  function doHardWork() nonReentrant whenStrategyDefined whenHarvestEnabled onlyControllerOrGovernance external {
+    if (_withdrawOnly()) revert ErrWithdrawOnly();
+    if (_positionOwnedByVault()) {
+      IERC721Upgradeable(_posManager()).transferFrom(address(this), _strategy(), _posId());
     }
-    // ensure that new funds are invested too
-    invest();
     IStrategy(_strategy()).doHardWork();
+    emit HarvestExecuted(block.timestamp, msg.sender);
   }
 
-  /* Returns the current underlying (e.g., DAI's) balance together with
-   * the invested amount (if DAI is invested elsewhere by the strategy).
-  */
-  function underlyingBalanceWithInvestment() view public returns (uint256) {
-    // note that the liquidity is not a token, so there is no local balance added
+  /// @notice Liquidity-equivalent value of the active position plus any idle balances. "Idle"
+  /// covers BOTH the vault's own token0/token1 balance AND the strategy's, because the strategy
+  /// may temporarily hold dust between compound cycles (e.g. token0 left over after an AERO swap
+  /// that couldn't yet value-balance into token1). That dust ultimately belongs to vault
+  /// shareholders, so it must contribute to NAV / PPS — and `preInteract` will physically sweep
+  /// it into the vault on the next user deposit/withdraw, keeping the actual payout consistent
+  /// with this read. Quoting math lives in CLRebalanceHelper to keep CLVault under the deploy
+  /// limit.
+  function underlyingBalanceWithInvestment() public view returns (uint256) {
     (,,,,,,, uint128 liquidity,,,,) = INonfungiblePositionManager(_posManager()).positions(_posId());
-    return liquidity;
+    address t0 = _token0();
+    address t1 = _token1();
+    uint256 idle0 = IERC20Upgradeable(t0).balanceOf(address(this));
+    uint256 idle1 = IERC20Upgradeable(t1).balanceOf(address(this));
+    address strat = _strategy();
+    if (strat != address(0)) {
+      idle0 += IERC20Upgradeable(t0).balanceOf(strat);
+      idle1 += IERC20Upgradeable(t1).balanceOf(strat);
+    }
+    return ICLRebalanceHelper(_rebalanceHelper()).quoteUnderlyingBalanceWithInvestment(
+      getSqrtPriceX96(),
+      _tickLower(),
+      _tickUpper(),
+      liquidity,
+      idle0,
+      idle1
+    );
   }
 
   function getPricePerFullShare() external view returns (uint256) {
     return totalSupply() == 0
       ? _underlyingUnit()
-      : _underlyingUnit().mul(underlyingBalanceWithInvestment()).div(totalSupply());
+      : (_underlyingUnit() * underlyingBalanceWithInvestment()) / totalSupply();
   }
 
-  /* get the user's share (in underlying)
-  */
-  function underlyingBalanceWithInvestmentForHolder(address holder) view external returns (uint256) {
-    if (totalSupply() == 0) {
-      return 0;
-    }
-    return underlyingBalanceWithInvestment()
-      .mul(balanceOf(holder))
-      .div(totalSupply());
-  }
-
-  function nextStrategy() external view returns (address) {
-    return _nextStrategy();
-  }
-
-  function nextStrategyTimestamp() external view returns (uint256) {
-    return _nextStrategyTimestamp();
-  }
-
-  function canUpdateStrategy(address __strategy) public view returns (bool) {
+  function _canUpdateStrategy(address __strategy) internal view returns (bool) {
     bool isStrategyNotSetYet = _strategy() == address(0);
     bool hasTimelockPassed = block.timestamp > _nextStrategyTimestamp() && _nextStrategyTimestamp() != 0;
     return isStrategyNotSetYet || (__strategy == _nextStrategy() && hasTimelockPassed);
@@ -232,81 +258,115 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
   */
   function announceStrategyUpdate(address _strategy) external onlyControllerOrGovernance {
     // records a new timestamp
-    uint256 when = block.timestamp.add(nextImplementationDelay());
+    uint256 when = block.timestamp + _nextImplementationDelay();
     _setNextStrategyTimestamp(when);
     _setNextStrategy(_strategy);
     emit StrategyAnnounced(_strategy, when);
   }
 
-  /**
-  * Finalizes (or cancels) the strategy update by resetting the data
-  */
-  function finalizeStrategyUpdate() public onlyControllerOrGovernance {
-    _setNextStrategyTimestamp(0);
-    _setNextStrategy(address(0));
-  }
-
   function setStrategy(address __strategy) external onlyControllerOrGovernance {
-    require(canUpdateStrategy(__strategy), "timelock");
-    require(__strategy != address(0));
-    require(IStrategy(__strategy).vault() == address(this), "vault");
+    if (!_canUpdateStrategy(__strategy)) revert ErrTimelock();
+    if (!(__strategy != address(0))) revert ErrZeroAddress();
+    if (!(IStrategy(__strategy).vault() == address(this))) revert ErrVault();
 
     emit StrategyChanged(__strategy, _strategy());
     if (address(__strategy) != address(_strategy())) {
-      if (address(_strategy()) != address(0)) { // if the original strategy (no underscore) is defined
+      if (address(_strategy()) != address(0)) {
         IStrategy(_strategy()).withdrawAllToVault(true);
       }
       _setStrategy(__strategy);
     }
-    finalizeStrategyUpdate();
+    _setNextStrategyTimestamp(0);
+    _setNextStrategy(address(0));
   }
 
-  function invest() internal whenStrategyDefined {
-    address _posManager = _posManager();
-    uint256 _posId = _posId();
-    bool nftInVault = INonfungiblePositionManager(_posManager).ownerOf(_posId) == address(this);
-    if (nftInVault) {
-      IERC721Upgradeable(_posManager).transferFrom(address(this), _strategy(), _posId);
-    }
+  function setLanePause(
+    bool _pauseDepositWithdrawValue,
+    bool _pauseHarvestValue,
+    bool _pauseRebalanceValue,
+    bool _withdrawOnlyValue
+  ) external onlyGovernance {
+    _setPauseDepositWithdraw(_pauseDepositWithdrawValue);
+    _setPauseHarvest(_pauseHarvestValue);
+    _setPauseRebalance(_pauseRebalanceValue);
+    _setWithdrawOnly(_withdrawOnlyValue);
+    emit LanePauseUpdated(_pauseDepositWithdrawValue, _pauseHarvestValue, _pauseRebalanceValue, _withdrawOnlyValue);
+  }
+
+  function setRebalanceConfig(
+    uint256 _deviation,
+    uint256 _cooldown,
+    address _executor
+  ) external onlyGovernance {
+    _setRebalanceDeviation(_deviation);
+    _setRebalanceCooldown(_cooldown);
+    _setRebalanceExecutor(_executor);
+    emit RebalanceConfigUpdated(_deviation, _cooldown, _executor);
+  }
+
+  function setRebalanceSafetyConfig(
+    uint256 _maxSwapBpsValue,
+    uint256 _maxSlippageBpsValue,
+    uint32 _twapWindowValue,
+    uint256 _maxTwapDeviationBpsValue
+  ) external onlyGovernance {
+    if (_maxSwapBpsValue > _BPS_DENOMINATOR) revert ErrSlippage();
+    if (_maxSlippageBpsValue > _BPS_DENOMINATOR) revert ErrSlippage();
+    if (_maxTwapDeviationBpsValue > _BPS_DENOMINATOR) revert ErrSlippage();
+    _setMaxSwapBps(_maxSwapBpsValue);
+    _setMaxSlippageBps(_maxSlippageBpsValue);
+    _setTwapWindow(_twapWindowValue);
+    _setMaxTwapDeviationBps(_maxTwapDeviationBpsValue);
+    emit RebalanceSafetyConfigUpdated(_maxSwapBpsValue, _maxSlippageBpsValue, _twapWindowValue, _maxTwapDeviationBpsValue);
+  }
+
+  /// @dev Helper is required by deposit/withdraw/PPS reads and rebalance. Setting it to address(0)
+  /// would brick deposits and PPS, so we reject zero outright. Governance can always swap to a
+  /// new non-zero helper instead.
+  function setRebalanceHelper(address helper) external onlyGovernance {
+    if (helper == address(0)) revert ErrZeroAddress();
+    _setRebalanceHelper(helper);
+    emit RebalanceHelperUpdated(helper);
+  }
+
+  function rebalanceHelper() external view returns (address) {
+    return _rebalanceHelper();
   }
 
   /*
   * Allows for depositing the underlying asset in exchange for shares.
   * Approval is assumed.
   */
-  function deposit(uint256 amount0, uint256 amount1, uint256 amountOutMin, address receiver) external nonReentrant defense returns (uint256 minted) {
-    minted = _deposit(amount0, amount1, amountOutMin, msg.sender, receiver);
+  function deposit(uint256 amount0, uint256 amount1, uint256 amountOutMin, address receiver) external nonReentrant whenDepositWithdrawEnabled returns (uint256 minted) {
+    if (_withdrawOnly()) revert ErrWithdrawOnly();
+    minted = _deposit(amount0, amount1, amountOutMin, receiver);
   }
 
-  function withdraw(uint256 shares, uint256 amount0OutMin, uint256 amount1OutMin) external nonReentrant defense returns (uint256 amount0, uint256 amount1) {
-    (amount0, amount1) = _withdraw(shares, amount0OutMin, amount1OutMin, msg.sender, msg.sender);
+  function withdraw(uint256 shares, uint256 amount0OutMin, uint256 amount1OutMin) external nonReentrant whenDepositWithdrawEnabled returns (uint256 amount0, uint256 amount1) {
+    (amount0, amount1) = _withdraw(shares, amount0OutMin, amount1OutMin);
   }
 
-  function withdrawAll(bool compound) public onlyControllerOrGovernance whenStrategyDefined {
-    IStrategy(_strategy()).withdrawAllToVault(compound);
-  }
+  function _deposit(uint256 amount0, uint256 amount1, uint256 amountOutMin, address beneficiary) internal returns (uint256) {
+    if (!(beneficiary != address(0))) revert ErrZeroAddress();
+    _ensurePositionInVault();
+    _sweepStrategyDust();
 
-  function _deposit(uint256 amount0, uint256 amount1, uint256 amountOutMin, address sender, address beneficiary) internal returns (uint256) {
-    require(beneficiary != address(0), "address(0)");
-    
-    if (_strategy() != address(0)) {
-      IStrategy(_strategy()).withdrawAllToVault(true);
-    }
-
-    address _token0 = _token0();
-    address _token1 = _token1();
-    IERC20Upgradeable(_token0).safeTransferFrom(sender, address(this), amount0);
-    IERC20Upgradeable(_token1).safeTransferFrom(sender, address(this), amount1);
-    
+    address t0 = _token0();
+    address t1 = _token1();
+    address pm = _posManager();
+    // NAV must be measured BEFORE the user's tokens land in the vault. If we read it after the
+    // safeTransferFrom calls, the user's own contribution shows up as idle in NAV and dilutes
+    // their share-mint ratio (toMint = liq * supply / liquidityBefore), transferring value to
+    // every other shareholder. Round-trip benchmark showed ~5%-of-deposit loss from this.
     uint256 liquidityBefore = underlyingBalanceWithInvestment();
-    
-    address _posManager = _posManager();
-    IERC20Upgradeable(_token0).safeApprove(_posManager, 0);
-    IERC20Upgradeable(_token0).safeApprove(_posManager, amount0);
-    IERC20Upgradeable(_token1).safeApprove(_posManager, 0);
-    IERC20Upgradeable(_token1).safeApprove(_posManager, amount1);
+    uint256 balance0Before = IERC20Upgradeable(t0).balanceOf(address(this));
+    uint256 balance1Before = IERC20Upgradeable(t1).balanceOf(address(this));
+    IERC20Upgradeable(t0).safeTransferFrom(msg.sender, address(this), amount0);
+    IERC20Upgradeable(t1).safeTransferFrom(msg.sender, address(this), amount1);
 
-    (uint128 _liquidity,,) = INonfungiblePositionManager(_posManager).increaseLiquidity(
+    _setApproval(t0, pm, amount0);
+    _setApproval(t1, pm, amount1);
+    (uint128 _liquidity,,) = INonfungiblePositionManager(pm).increaseLiquidity(
       INonfungiblePositionManager.IncreaseLiquidityParams({
         tokenId: _posId(),
         amount0Desired: amount0,
@@ -319,60 +379,51 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
 
     uint256 toMint = totalSupply() == 0
       ? uint256(_liquidity)
-      : uint256(_liquidity).mul(totalSupply()).div(liquidityBefore);
-    
-    require(toMint >= amountOutMin, "slippage");
-    
-    _mint(beneficiary, toMint);
-    emit Deposit(sender, beneficiary, amount0, amount1, toMint);
+      : (uint256(_liquidity) * totalSupply()) / liquidityBefore;
 
-    _transferLeftOverTo(beneficiary);
-    if (_strategy() != address(0)) {
-      invest();
-      IStrategy(_strategy()).doHardWork();
-    }
+    if (toMint == 0) revert ErrZeroShares();
+    if (!(toMint >= amountOutMin)) revert ErrSlippage();
+
+    _mint(beneficiary, toMint);
+    emit Deposit(msg.sender, beneficiary, amount0, amount1, toMint);
+
+    _transferUnusedDepositTo(beneficiary, balance0Before, balance1Before);
+    _restakePosition();
     return toMint;
   }
 
-  function _withdraw(uint256 numberOfShares, uint256 amount0OutMin, uint256 amount1OutMin, address receiver, address owner) internal returns (uint256, uint256) {
-    require(totalSupply() > 0);
-    require(numberOfShares > 0, "!0");
+  function _withdraw(uint256 numberOfShares, uint256 amount0OutMin, uint256 amount1OutMin) internal returns (uint256, uint256) {
+    uint256 supply = totalSupply();
+    if (!(supply > 0)) revert ErrTotalSupply();
+    if (!(numberOfShares > 0)) revert ErrZeroShares();
+    _ensurePositionInVault();
+    _sweepStrategyDust();
 
-    if (_strategy() != address(0)) {
-      IStrategy(_strategy()).withdrawAllToVault(false);
-    }
+    address t0 = _token0();
+    address t1 = _token1();
+    uint256 totalLiquidity = _positionLiquidity();
+    WithdrawCache memory vars;
+    vars.supplyBefore = supply;
+    vars.idleShare0 = (IERC20Upgradeable(t0).balanceOf(address(this)) * numberOfShares) / vars.supplyBefore;
+    vars.idleShare1 = (IERC20Upgradeable(t1).balanceOf(address(this)) * numberOfShares) / vars.supplyBefore;
+    vars.liquidityShare = uint128((totalLiquidity * numberOfShares) / vars.supplyBefore);
+    _burn(msg.sender, numberOfShares);
 
-    uint128 liquidityShare = uint128(underlyingBalanceWithInvestment().mul(numberOfShares).div(totalSupply()));
+    (vars.received0, vars.received1) = _removeFromPosition(vars.liquidityShare, totalLiquidity, amount0OutMin, amount1OutMin);
+    vars.payout0 = vars.received0 + vars.idleShare0;
+    vars.payout1 = vars.received1 + vars.idleShare1;
+    _safeTransferIfPositive(t0, msg.sender, vars.payout0);
+    _safeTransferIfPositive(t1, msg.sender, vars.payout1);
+    emit Withdraw(msg.sender, msg.sender, msg.sender, vars.payout0, vars.payout1, numberOfShares);
 
-    if (msg.sender != owner) {
-      uint256 currentAllowance = allowance(owner, msg.sender);
-      if (currentAllowance != type(uint256).max) {
-        require(currentAllowance >= numberOfShares, "ERC20: transfer amount exceeds allowance");
-        _approve(owner, msg.sender, currentAllowance - numberOfShares);
-      }
-    }
-
-    _burn(owner, numberOfShares);
-
-    (uint256 received0, uint256 received1) = _removeFromPosition(liquidityShare, amount0OutMin, amount1OutMin);
-
-    _transferLeftOverTo(receiver);
-    emit Withdraw(msg.sender, receiver, owner, received0, received1, numberOfShares);
-
-    if (_strategy() != address(0)) {
-      invest();
-      IStrategy(_strategy()).doHardWork();
-    }
-    return (received0, received1);
+    _restakePosition();
+    return (vars.payout0, vars.payout1);
   }
 
-  function _removeFromPosition(uint128 liquidityAmount, uint256 amount0Min, uint256 amount1Min) internal returns (uint256, uint256) {
+  function _removeFromPosition(uint128 liquidityAmount, uint256 totalLiquidity, uint256 amount0Min, uint256 amount1Min) internal returns (uint256, uint256) {
     address _posManager = _posManager();
     uint256 _posId = _posId();
-    bool withdrawAllLiquidity = false;
-    if (liquidityAmount == underlyingBalanceWithInvestment()) {
-      withdrawAllLiquidity = true;
-    }
+    bool withdrawAllLiquidity = uint256(liquidityAmount) == totalLiquidity;
 
     // withdraw liquidity from the NFT
     (uint256 _receivedToken0, uint256 _receivedToken1) = INonfungiblePositionManager(_posManager).decreaseLiquidity(
@@ -405,124 +456,217 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
     return(_receivedToken0, _receivedToken1);
   }
 
-  /**
-     * @dev Handles transferring the leftovers
-     */
+  /// @dev Transfers the vault's ENTIRE token0/token1 balance to `_to`. Equivalent to
+  /// `_transferUnusedDepositTo(_to, 0, 0)` — kept as a named wrapper for call-site readability.
   function _transferLeftOverTo(address _to) internal {
+    _transferUnusedDepositTo(_to, 0, 0);
+  }
+
+  /// @dev Transfers only the DELTA above the supplied baselines to `_to`. Pre-existing vault
+  /// balances (the part backing NAV for existing shareholders) are mathematically untouchable
+  /// through this path.
+  function _transferUnusedDepositTo(address _to, uint256 balance0Before, uint256 balance1Before) internal {
     address _token0 = _token0();
     address _token1 = _token1();
     uint256 balance0 = IERC20Upgradeable(_token0).balanceOf(address(this));
     uint256 balance1 = IERC20Upgradeable(_token1).balanceOf(address(this));
-    if (balance0 > 0) {
-      IERC20Upgradeable(_token0).safeTransfer(_to, balance0);
+    if (balance0 > balance0Before) {
+      _safeTransferIfPositive(_token0, _to, balance0 - balance0Before);
     }
-    if (balance1 > 0) {
-      IERC20Upgradeable(_token1).safeTransfer(_to, balance1);
+    if (balance1 > balance1Before) {
+      _safeTransferIfPositive(_token1, _to, balance1 - balance1Before);
     }
   }
 
-  function sweepDust() external onlyControllerOrGovernance {
-    _transferLeftOverTo(governance());
+  function _safeTransferIfPositive(address token, address receiver, uint256 amount) internal {
+    if (amount > 0) {
+      IERC20Upgradeable(token).safeTransfer(receiver, amount);
+    }
   }
 
-  function getPoolSlot0() internal view returns (uint160, int24, uint16, uint16, uint16, bool) {
-    address factory = INonfungiblePositionManager(_posManager()).factory();
-    address poolAddr = IFactory(factory).getPool(_token0(), _token1(), _tickSpacing());
-    return IPool(poolAddr).slot0();
+  function _positionLiquidity() internal view returns (uint256) {
+    (,,,,,,, uint128 liquidity,,,,) = INonfungiblePositionManager(_posManager()).positions(_posId());
+    return uint256(liquidity);
   }
 
-  /**
-  * @dev Convenience getter for the current sqrtPriceX96 of the Uniswap pool.
-  */
-  function getSqrtPriceX96() public view returns (uint160 sqrtPriceX96) {
-    (sqrtPriceX96,,,,,) = getPoolSlot0();
+  function _positionOwnedByVault() internal view returns (bool) {
+    return INonfungiblePositionManager(_posManager()).ownerOf(_posId()) == address(this);
   }
 
-  function getCurrentTick() public view returns (int24 currenTick) {
-    (,currenTick,,,,) = getPoolSlot0();
+  function _ensurePositionInVault() internal {
+    if (_positionOwnedByVault()) {
+      return;
+    }
+    address currentStrategy = _strategy();
+    if (currentStrategy == address(0)) revert ErrPositionNotInVault();
+    IStrategy(currentStrategy).withdrawAllToVault(false);
+    if (!_positionOwnedByVault()) revert ErrPositionNotInVault();
   }
 
-  function inRange() public view returns (bool _inRange) {
-    uint160 currentSqrtPrice = getSqrtPriceX96();
-    uint160 lowerSqrtPrice = TickMath.getSqrtRatioAtTick(_tickLower());
-    uint160 upperSqrtPrice = TickMath.getSqrtRatioAtTick(_tickUpper());
-    _inRange = lowerSqrtPrice < currentSqrtPrice && currentSqrtPrice < upperSqrtPrice;
+  /// @dev Asks the strategy to flush its token0/token1 idle into the vault. Called at the start
+  /// of every user deposit and withdraw so dust accumulated by the strategy (e.g. residual from a
+  /// failed compound) becomes part of the vault's idle balance — and therefore part of NAV /
+  /// payout for the current interaction. View-only `underlyingBalanceWithInvestment` already
+  /// counts strategy idle, so PPS stays consistent between interactions; this physical sweep
+  /// makes payouts match the PPS read.
+  function _sweepStrategyDust() internal {
+    address currentStrategy = _strategy();
+    if (currentStrategy == address(0)) return;
+    IStrategy(currentStrategy).preInteract();
   }
 
-  function getCurrentTokenAmounts() public view returns (uint256 amount0, uint256 amount1) {
-    (amount0, amount1) = LiquidityAmounts.getAmountsForLiquidity(
-      getSqrtPriceX96(),
-      TickMath.getSqrtRatioAtTick(_tickLower()),
-      TickMath.getSqrtRatioAtTick(_tickUpper()),
-      uint128(underlyingBalanceWithInvestment())
+  /// @dev Re-stake the position NFT back into the gauge at the end of a user interaction.
+  /// `_ensurePositionInVault` pulls the NFT into the vault at the start of every deposit/withdraw
+  /// (so `increaseLiquidity` / `decreaseLiquidity` work). Without this counterpart, the NFT
+  /// would sit unstaked in the vault until the next `doHardWork`, missing gauge emissions for
+  /// the entire window. We push the NFT back to the strategy and ask it to stake; the strategy
+  /// silently skips if investing is paused or in withdraw-only mode.
+  ///
+  /// The stake call is wrapped in a try/catch so a temporarily-paused or otherwise reverting
+  /// gauge cannot brick user deposits/withdraws. On failure, the NFT remains in the strategy
+  /// (still in the custody chain) until the next interaction or `doHardWork` succeeds in
+  /// staking it.
+  function _restakePosition() internal {
+    _restakePosition(false);
+  }
+
+  /// @dev `absorbIdle = true` performs a full `doHardWork` cycle on the strategy instead of
+  /// just staking. Used at the end of a rebalance so any token0/token1 idle the strategy has
+  /// accumulated (rebalance leftovers, prior failed compound, etc.) gets folded into the new
+  /// position via `increaseLiquidity` before the NFT goes back into the gauge. User deposits
+  /// and withdraws use `absorbIdle=false` to keep their gas cost low — absorb happens on the
+  /// next rebalance or doHardWork.
+  function _restakePosition(bool absorbIdle) internal {
+    address currentStrategy = _strategy();
+    if (currentStrategy == address(0)) return;
+    address pm = _posManager();
+    uint256 pid = _posId();
+    if (INonfungiblePositionManager(pm).ownerOf(pid) == address(this)) {
+      IERC721Upgradeable(pm).safeTransferFrom(address(this), currentStrategy, pid);
+    }
+    if (absorbIdle) {
+      // doHardWork = _withdraw + _liquidateReward + _absorbIdleIntoPosition + _investAllUnderlying.
+      // Falls through to stakePosition on revert (e.g. investing paused, harvest paused) so the
+      // NFT still gets staked when possible even if absorb is blocked.
+      try IStrategy(currentStrategy).doHardWork() {
+        return;
+      } catch {}
+    }
+    try IStrategy(currentStrategy).stakePosition() {} catch {}
+  }
+
+  /// @notice Rescue an ERC20 that isn't part of the vault's accounting (e.g. an airdrop or
+  /// an accidental transfer of an unrelated token). token0 and token1 are blocked because they
+  /// back PPS — vault idle of those is counted in `underlyingBalanceWithInvestment` and belongs
+  /// to share holders, not governance. Use for stray tokens only.
+  function sweepStrayToken(address token, address to) external onlyControllerOrGovernance {
+    if (token == _token0() || token == _token1()) revert ErrProtectedToken();
+    if (to == address(0)) revert ErrZeroAddress();
+    uint256 bal = IERC20Upgradeable(token).balanceOf(address(this));
+    if (bal > 0) IERC20Upgradeable(token).safeTransfer(to, bal);
+  }
+
+  /// @notice Current pool sqrtPriceX96. Read goes through the helper so CLVault doesn't have to
+  /// import IPool just for slot0.
+  function getSqrtPriceX96() public view returns (uint160) {
+    return ICLRebalanceHelper(_rebalanceHelper()).spotSqrtPriceX96(_poolAddress());
+  }
+
+  /// @notice Current (amount0, amount1) the position's liquidity represents at spot price.
+  /// Used by ERC4626-style wrappers to decide a single-asset zap-in split.
+  function getCurrentTokenAmounts() external view returns (uint256, uint256) {
+    return ICLRebalanceHelper(_rebalanceHelper()).getCurrentTokenAmounts(
+      _poolAddress(), _posManager(), _posId(), _tickLower(), _tickUpper()
     );
   }
 
-  function getCurrentTokenWeights() public view returns (uint256 weight0, uint256 weight1) {
-    (weight0, weight1) = _getWeightsForTickLimits(_tickLower(), _tickUpper());
-  }
-
-  function _shouldRebalance() internal view returns (bool shouldRebalance) {
-    if (_posWidth() == _targetWidth()) {
-      shouldRebalance = !inRange();
-    } else {
-      int256 middleTick = (int256(_tickLower()) + int256(_tickUpper())) / 2;
-      int256 currentTick = int256(getCurrentTick());
-      uint256 diff = middleTick > currentTick ? uint256(middleTick - currentTick) : uint256(currentTick - middleTick);
-      uint256 maxDiff = _targetWidth().mul(uint256(int256(_tickSpacing()))).div(2);
-
-      shouldRebalance = diff > maxDiff;
-    }
+  /// @notice Per-token spot value-weights (sum == 1e18). Used by ERC4626-style wrappers.
+  function getCurrentTokenWeights() external view returns (uint256, uint256) {
+    return ICLRebalanceHelper(_rebalanceHelper()).getCurrentTokenWeights(
+      _poolAddress(), _posManager(), _posId(), _tickLower(), _tickUpper()
+    );
   }
 
   function checker() external view returns (bool canExec, bytes memory execPayload) {
-    canExec = _shouldRebalance();
-    execPayload = abi.encodeWithSelector(IController.doHardWork.selector, address(this));
+    address helper = _rebalanceHelper();
+    if (helper == address(0)) {
+      canExec = false;
+    } else {
+      canExec = ICLRebalanceHelper(helper).shouldRebalance(
+        _poolAddress(),
+        _tickLower(),
+        _tickUpper(),
+        _tickSpacing(),
+        _posWidth(),
+        _targetWidth(),
+        _lastRebalance(),
+        _rebalanceCooldown(),
+        _rebalanceDeviation(),
+        block.timestamp
+      );
+    }
+    execPayload = abi.encodeWithSelector(this.rebalanceCurrentTick.selector, _targetWidth());
   }
 
-  function rebalanceCurrentTick(uint256 _posWidth) public onlyControllerOrGovernance {
+  /// @dev Anchors burn/mint mins to the TWAP price so a sandwicher who shifts spot within
+  /// _maxTwapDeviationBps still can't extract more than _maxSlippageBps per side. Quoting,
+  /// tick-limit math and TWAP validation are folded into helper calls so CLVault stays under
+  /// the 24,576-byte deploy limit.
+  function rebalanceCurrentTick(uint256 _newPosWidth) public onlyRebalanceExecutor whenRebalanceEnabled {
+    if (_withdrawOnly()) revert ErrWithdrawOnly();
+    if (!(block.timestamp >= _lastRebalance() + _rebalanceCooldown())) revert ErrRebalanceCooldown();
+    if (!(_newPosWidth <= _posWidth())) revert ErrTargetWidth();
+    _ensurePositionInVault();
+    // Helper required: a zero helper makes prepareRebalance call address(0), which returns
+    // empty data and reverts in the abi-decode below — louder than a custom error but saves
+    // bytecode toward the 24,576-byte deploy limit.
+    ICLRebalanceHelper rh = ICLRebalanceHelper(_rebalanceHelper());
+
     uint256 oldLiquidity = underlyingBalanceWithInvestment();
     uint256 oldPosId = _posId();
-    int24 currentTick = getCurrentTick();
+    uint128 oldLiq = uint128(_positionLiquidity());
+    address pool = _poolAddress();
+    uint32 window = _twapWindow();
+    uint256 slip = _maxSlippageBps();
 
-    (int24 tickLowerNew, int24 tickUpperNew) = _getNewTickLimits(currentTick, int24(int256(_posWidth)));
+    (int24 tickLowerNew, int24 tickUpperNew, uint256 burnMin0, uint256 burnMin1) = rh.prepareRebalance(
+      pool,
+      window,
+      _maxTwapDeviationBps(),
+      slip,
+      int24(int256(_newPosWidth)),
+      _tickSpacing(),
+      _tickLower(),
+      _tickUpper(),
+      oldLiq
+    );
     if (tickLowerNew == _tickLower() && tickUpperNew == _tickUpper()) {
       return;
     }
-    
-    (uint256 newWeight0, uint256 newWeight1) = _getWeightsForTickLimits(tickLowerNew, tickUpperNew);
-    (uint256 currentWeight0, uint256 currentWeight1) = getCurrentTokenWeights();
-
-    if (_strategy() != address(0)) {
-      IStrategy(_strategy()).withdrawAllToVault(false);
-    }
-
-    _removeFromPosition(uint128(underlyingBalanceWithInvestment()), 0, 0);
+    // liquidityAmount == totalLiquidity here: a rebalance always burns the whole position.
+    _removeFromPosition(oldLiq, uint256(oldLiq), burnMin0, burnMin1);
     INonfungiblePositionManager(_posManager()).burn(oldPosId);
-    
-    if (currentWeight0 > newWeight0) {
-      bool zeroForOne = true;
-      uint256 toSwap = IERC20Upgradeable(_token0()).balanceOf(address(this)).mul(currentWeight0.sub(newWeight0)).div(currentWeight0);
-      if (toSwap > 0) {
-        _swap(zeroForOne, toSwap);
-      }
-    } else {
-      bool zeroForOne = false;
-      uint256 toSwap = IERC20Upgradeable(_token1()).balanceOf(address(this)).mul(currentWeight1.sub(newWeight1)).div(currentWeight1);
-      if (toSwap > 0) {
-        _swap(zeroForOne, toSwap);
-      }
-    }
+    _rebalanceIdleBalancesWithGuards(tickLowerNew, tickUpperNew);
 
-    uint256 tokenId = _createNewPosition(tickLowerNew, tickUpperNew);
+    (uint256 mintMin0, uint256 mintMin1) = rh.quoteMintMins(
+      pool,
+      window,
+      tickLowerNew,
+      tickUpperNew,
+      IERC20Upgradeable(_token0()).balanceOf(address(this)),
+      IERC20Upgradeable(_token1()).balanceOf(address(this)),
+      slip
+    );
+    uint256 tokenId = _createNewPosition(tickLowerNew, tickUpperNew, mintMin0, mintMin1, block.timestamp + 900);
 
     _setPosId(tokenId);
     _setTickLower(tickLowerNew);
     _setTickUpper(tickUpperNew);
-    _setPosWidth(_posWidth);
-    if (_posWidth < _targetWidth()) {
-      _setTargetWidth(_posWidth);
+    _setPosWidth(_newPosWidth);
+    if (_newPosWidth < _targetWidth()) {
+      _setTargetWidth(_newPosWidth);
     }
+    _setLastRebalance(block.timestamp);
 
     if (_strategy() != address(0)) {
       _transferLeftOverTo(_strategy());
@@ -530,19 +674,27 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
       _transferLeftOverTo(governance());
     }
 
+    // Rebalance path: absorb any strategy-held idle into the new position before staking.
+    // Without this, idle from prior rebalances (and the leftover ERC20s we just transferred to
+    // the strategy) keeps accumulating instead of growing the active position.
+    _restakePosition(true);
     emit Rebalanced(oldPosId, tokenId, oldLiquidity, underlyingBalanceWithInvestment(), block.timestamp);
   }
 
-  function _createNewPosition(int24 _tickLower, int24 _tickUpper) internal returns (uint256 tokenId) {
+  function _createNewPosition(
+    int24 _tickLower,
+    int24 _tickUpper,
+    uint256 amount0Min,
+    uint256 amount1Min,
+    uint256 deadline
+  ) internal returns (uint256 tokenId) {
     address _token0 = _token0();
     address _token1 = _token1();
     uint256 amount0 = IERC20Upgradeable(_token0).balanceOf(address(this));
     uint256 amount1 = IERC20Upgradeable(_token1).balanceOf(address(this));
     address _posManager = _posManager();
-    IERC20Upgradeable(_token0).safeApprove(_posManager, 0);
-    IERC20Upgradeable(_token0).safeApprove(_posManager, amount0);
-    IERC20Upgradeable(_token1).safeApprove(_posManager, 0);
-    IERC20Upgradeable(_token1).safeApprove(_posManager, amount1);
+    _setApproval(_token0, _posManager, amount0);
+    _setApproval(_token1, _posManager, amount1);
 
     (tokenId,,,) = INonfungiblePositionManager(_posManager).mint(
       INonfungiblePositionManager.MintParams({
@@ -553,86 +705,64 @@ contract CLVault is ERC20Upgradeable, ERC721HolderUpgradeable, IUpgradeSource, C
         tickUpper: _tickUpper,
         amount0Desired: amount0,
         amount1Desired: amount1,
-        amount0Min: 0,
-        amount1Min: 0,
+        amount0Min: amount0Min,
+        amount1Min: amount1Min,
         recipient: address(this),
-        deadline: block.timestamp,
+        deadline: deadline,
         sqrtPriceX96: 0
       })
     );
   }
 
-  function _swap(bool _zeroForOne, uint256 _amountIn) internal {
-    address _token0 = _token0();
-    address _token1 = _token1();
-    address _universalLiquidator = IController(controller()).universalLiquidator();
-    if (_zeroForOne) {
-      IERC20Upgradeable(_token0).safeApprove(_universalLiquidator, 0);
-      IERC20Upgradeable(_token0).safeApprove(_universalLiquidator, _amountIn);
-      IUniversalLiquidator(_universalLiquidator).swap(_token0, _token1, _amountIn, 1, address(this));
-    } else {
-      IERC20Upgradeable(_token1).safeApprove(_universalLiquidator, 0);
-      IERC20Upgradeable(_token1).safeApprove(_universalLiquidator, _amountIn);
-      IUniversalLiquidator(_universalLiquidator).swap(_token1, _token0, _amountIn, 1, address(this));
-    }
+  function _setApproval(address token, address spender, uint256 amount) internal {
+    IERC20Upgradeable(token).safeApprove(spender, 0);
+    IERC20Upgradeable(token).safeApprove(spender, amount);
   }
 
-  function _getWeightsForTickLimits(int24 _tickLower, int24 _tickUpper) internal view returns (uint256 weight0, uint256 weight1) {
-    uint256 sqrtPrice = uint256(getSqrtPriceX96());
-    uint256 price0In1 = sqrtPrice.mul(sqrtPrice).mul(1e18).div(uint(2**(96 * 2)));
-    (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
-      getSqrtPriceX96(),
-      TickMath.getSqrtRatioAtTick(_tickLower),
-      TickMath.getSqrtRatioAtTick(_tickUpper),
-      uint128(1e18)
+
+  function _poolAddress() internal view returns (address) {
+    return ICLRebalanceHelper(_rebalanceHelper()).poolAddressFor(_posManager(), _token0(), _token1(), _tickSpacing());
+  }
+
+  /// @dev Range-aware idle rebalance: uses `planSwapForMint` (which knows the new tick range)
+  /// instead of the legacy 50/50 `planSwap`. Mint at the new range generally needs a non-50/50
+  /// (a0, a1) ratio (depending on where sqrt sits within `[sqrtLower, sqrtUpper]`); aiming for
+  /// 50/50 left up to 50% of value as dust after mint. Now we aim for the exact ratio mint
+  /// will consume.
+  function _rebalanceIdleBalancesWithGuards(int24 newTickLower, int24 newTickUpper) internal {
+    address helper = _rebalanceHelper();
+    if (helper == address(0)) return;
+    address t0 = _token0();
+    address t1 = _token1();
+    uint256 b0 = IERC20Upgradeable(t0).balanceOf(address(this));
+    uint256 b1 = IERC20Upgradeable(t1).balanceOf(address(this));
+    if (b0 == 0 && b1 == 0) return;
+    ICLRebalanceHelper.RebalanceSwapPlan memory plan = ICLRebalanceHelper(helper).planSwapForMint(
+      _poolAddress(),
+      newTickLower,
+      newTickUpper,
+      b0,
+      b1,
+      _maxSwapBps(),
+      _maxSlippageBps(),
+      _twapWindow(),
+      _maxTwapDeviationBps()
     );
-
-    uint256 totalBalanceIn1 = amount0.mul(price0In1).div(1e18).add(amount1);
-    weight0 = amount0.mul(price0In1).div(totalBalanceIn1);
-    weight1 = amount1.mul(1e18).div(totalBalanceIn1);
-    if (weight0 == 0){
-      weight1 = 1e18;
-    }
-    if (weight1 == 0){
-      weight0 = 1e18;
-    }
-    uint256 totalWeight = weight0.add(weight1);
-    if (totalWeight != 1e18) {
-      weight0 = weight0.mul(1e18).div(totalWeight);
-      weight1 = uint256(1e18).sub(weight0);
-    }
+    if (!plan.shouldSwap || plan.amountIn == 0 || plan.minOut == 0) return;
+    (address tokenIn, address tokenOut) = plan.zeroForOne ? (t0, t1) : (t1, t0);
+    address liquidator = IController(controller()).universalLiquidator();
+    _setApproval(tokenIn, liquidator, plan.amountIn);
+    IUniversalLiquidator(liquidator).swap(tokenIn, tokenOut, plan.amountIn, plan.minOut, address(this));
   }
 
-  function _getNewTickLimits(int24 middle, int24 _posWidth) internal view returns (int24 tickLowerNew, int24 tickUpperNew) {
-    int24 _tickSpacing = _tickSpacing();
-    
-    int24 middleTickTrunc;
-    uint160 currentSqrtPrice = getSqrtPriceX96();
-    uint160 tickSqrtPrice = TickMath.getSqrtRatioAtTick(middle / _tickSpacing * _tickSpacing);
-    if (currentSqrtPrice > tickSqrtPrice) {
-      middleTickTrunc = middle / _tickSpacing;
-    } else {
-      middleTickTrunc = middle / _tickSpacing - 1;
-    }
 
-    int24 tickLowerNewTrunc;
-    if (_posWidth == 1) {
-      tickLowerNewTrunc = middleTickTrunc;
-    } else {
-      tickLowerNewTrunc = middleTickTrunc - _posWidth / 2;
-    }
-    int24 tickUpperNewTrunc = tickLowerNewTrunc + _posWidth;
-
-    tickLowerNew = tickLowerNewTrunc * _tickSpacing;
-    tickUpperNew = tickUpperNewTrunc * _tickSpacing;
-  }
 
   /**
   * Schedules an upgrade for this vault's proxy.
   */
   function scheduleUpgrade(address impl) public onlyGovernance {
     _setNextImplementation(impl);
-    _setNextImplementationTimestamp(block.timestamp.add(nextImplementationDelay()));
+    _setNextImplementationTimestamp(block.timestamp + _nextImplementationDelay());
   }
 
   function shouldUpgrade() external view override returns (bool, address) {

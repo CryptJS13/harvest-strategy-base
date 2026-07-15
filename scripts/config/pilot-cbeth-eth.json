@@ -1,0 +1,25 @@
+{
+  "name": "pilot-cbeth-eth",
+  "addressesPath": "test/test-config.js",
+  "posId": "70686961",
+  "posManager": "0x827922686190790b37229fd06084350E74485b72",
+  "targetWidth": "1",
+  "strategyName": "AerodromeCLStrategyMainnet_cbETH_ETH1",
+  "rebalanceHelper": "0xfE3f01311f6798889829c2816C4a9A4B01bE8288",
+  "deploySharedHelper": false,
+  "rebalance": {
+    "deviation": 0,
+    "cooldown": 5,
+    "executor": "0x6a74649aCFD7822ae8Fb78463a9f2192752E5Aa2",
+    "maxSwapBps": 5000,
+    "maxSlippageBps": 100,
+    "twapWindow": 120,
+    "maxTwapDeviationBps": 200
+  },
+  "strategy": {
+    "minRewardToCompound": "10000000000000000"
+  },
+  "wrappers": { "deploy": true },
+  "verify": true,
+  "snapshotPath": "scripts/deployments/cl/pilot-cbeth-eth.json"
+}

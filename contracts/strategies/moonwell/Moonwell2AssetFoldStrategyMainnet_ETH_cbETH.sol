@@ -26,7 +26,7 @@ contract Moonwell2AssetFoldStrategyMainnet_ETH_cbETH is Moonwell2AssetFoldStrate
       wethMToken,
       comptroller,
       well,
-      7900,
+      8000,
       8099,
       50,
       true

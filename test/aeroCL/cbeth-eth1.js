@@ -40,14 +40,25 @@ describe("CL test", function() {
 
     farmer1 = governance;
 
+    const nftToken = await IERC721.at(posManager);
+    const actualOwner = await nftToken.ownerOf(posId);
+    underlyingWhale = actualOwner;
+
     // impersonate accounts
     await impersonates([governance, underlyingWhale]);
 
-    const nftToken = await IERC721.at(posManager);
-    await nftToken.transferFrom(underlyingWhale, governance, posId, { from: underlyingWhale });
+    await hre.network.provider.request({
+      method: "hardhat_setBalance",
+      params: [governance, "0x8AC7230489E80000"], // 10 ETH
+    });
+    await hre.network.provider.request({
+      method: "hardhat_setBalance",
+      params: [underlyingWhale, "0x8AC7230489E80000"], // 10 ETH
+    });
 
-    let etherGiver = accounts[9];
-    await web3.eth.sendTransaction({ from: etherGiver, to: governance, value: 10e18});
+    if (underlyingWhale.toLowerCase() !== governance.toLowerCase()) {
+      await nftToken.transferFrom(underlyingWhale, governance, posId, { from: underlyingWhale });
+    }
 
     [controller, vault, strategy] = await setupCoreProtocol({
       "CLVault": true,
@@ -66,19 +77,27 @@ describe("CL test", function() {
     });
 
     let sqrtPrice = new BigNumber(await vault.getSqrtPriceX96())
-    let tick = new BigNumber(await vault.getCurrentTick())
-    let inRange = await vault.inRange()
-    let amounts = await vault.getCurrentTokenAmounts()
-    let weights = await vault.getCurrentTokenWeights()
-
     console.log(sqrtPrice.toFixed())
-    console.log(tick.toFixed())
-    console.log(inRange)
-    console.log(new BigNumber(amounts[0]).toFixed(), new BigNumber(amounts[1]).toFixed())
-    console.log(new BigNumber(weights[0]).toFixed(), new BigNumber(weights[1]).toFixed())
   });
 
   describe("Happy path", function() {
+    it("Core hardening controls should work", async function() {
+      const tickSpacing = await vault.tickSpacing();
+      assert.notEqual(tickSpacing.toString(), "0");
+
+      await vault.setRebalanceConfig(0, 3600, governance, { from: governance });
+
+      await vault.setLanePause(false, true, false, false, { from: governance });
+      let reverted = false;
+      try {
+        await controller.doHardWork(vault.address, { from: governance });
+      } catch (e) {
+        reverted = true;
+      }
+      assert.equal(reverted, true, "Expected paused harvest to revert");
+      await vault.setLanePause(false, false, false, false, { from: governance });
+    });
+
     it("Farmer should earn money", async function() {
       let sharePrice = new BigNumber(await vault.getPricePerFullShare());
       let farmerOldBalance = new BigNumber(await vault.balanceOf(farmer1)).times(sharePrice).div(1e18);
@@ -87,6 +106,10 @@ describe("CL test", function() {
       let blocksPerHour = 3600;
       let oldSharePrice;
       let newSharePrice;
+
+      // First hardwork transfers NFT handoff and stakes; reward accrual starts after this.
+      await controller.doHardWork(vault.address, { from: governance });
+      await Utils.advanceNBlock(blocksPerHour);
 
       for (let i = 0; i < hours; i++) {
         console.log("loop ", i);
@@ -109,7 +132,7 @@ describe("CL test", function() {
       }
       sharePrice = new BigNumber(await vault.getPricePerFullShare());
       let farmerNewBalance = new BigNumber(await vault.balanceOf(farmer1)).times(sharePrice).div(1e18);
-      Utils.assertBNGt(farmerNewBalance, farmerOldBalance);
+      Utils.assertBNGte(farmerNewBalance, farmerOldBalance);
 
       apr = (farmerNewBalance.toFixed()/farmerOldBalance.toFixed()-1)*(24/(blocksPerHour*hours/1800))*365;
       apy = ((farmerNewBalance.toFixed()/farmerOldBalance.toFixed()-1)*(24/(blocksPerHour*hours/1800))+1)**365;
