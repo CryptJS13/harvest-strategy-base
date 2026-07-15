@@ -4,49 +4,20 @@ pragma solidity 0.8.26;
 import "@openzeppelin/contracts/token/ERC721/extensions/IERC721Metadata.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/IERC721Enumerable.sol";
 
-import "./IERC721Permit.sol";
-import "./IERC4906.sol";
-import "./IPeripheryPayments.sol";
 import "./IPeripheryImmutableState.sol";
 
 /// @title Non-fungible token for positions
 /// @notice Wraps CL positions in a non-fungible token interface which allows for them to be transferred
 /// and authorized.
+/// @dev Trimmed vendored interface: only the members the CL system actually calls are kept
+/// (positions/mint/increaseLiquidity/decreaseLiquidity/collect/burn + the inherited ERC721
+/// surface and factory()). Admin members, permit, payment sweeps, and event declarations from
+/// the canonical upstream file were dropped as dead weight.
 interface INonfungiblePositionManager is
-    IPeripheryPayments,
     IPeripheryImmutableState,
     IERC721Metadata,
-    IERC721Enumerable,
-    IERC721Permit,
-    IERC4906
+    IERC721Enumerable
 {
-    /// @notice Emitted when liquidity is increased for a position NFT
-    /// @dev Also emitted when a token is minted
-    /// @param tokenId The ID of the token for which liquidity was increased
-    /// @param liquidity The amount by which liquidity for the NFT position was increased
-    /// @param amount0 The amount of token0 that was paid for the increase in liquidity
-    /// @param amount1 The amount of token1 that was paid for the increase in liquidity
-    event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
-    /// @notice Emitted when liquidity is decreased for a position NFT
-    /// @param tokenId The ID of the token for which liquidity was decreased
-    /// @param liquidity The amount by which liquidity for the NFT position was decreased
-    /// @param amount0 The amount of token0 that was accounted for the decrease in liquidity
-    /// @param amount1 The amount of token1 that was accounted for the decrease in liquidity
-    event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
-    /// @notice Emitted when tokens are collected for a position NFT
-    /// @dev The amounts reported may not be exactly equivalent to the amounts transferred, due to rounding behavior
-    /// @param tokenId The ID of the token for which underlying tokens were collected
-    /// @param recipient The address of the account that received the collected tokens
-    /// @param amount0 The amount of token0 owed to the position that was collected
-    /// @param amount1 The amount of token1 owed to the position that was collected
-    event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1);
-    /// @notice Emitted when a new Token Descriptor is set
-    /// @param tokenDescriptor Address of the new Token Descriptor
-    event TokenDescriptorChanged(address indexed tokenDescriptor);
-    /// @notice Emitted when a new Owner is set
-    /// @param owner Address of the new Owner
-    event TransferOwnership(address indexed owner);
-
     /// @notice Returns the position information associated with a given token ID.
     /// @dev Throws if the token ID is not valid.
     /// @param tokenId The ID of the token that represents the position
@@ -79,12 +50,6 @@ interface INonfungiblePositionManager is
             uint128 tokensOwed0,
             uint128 tokensOwed1
         );
-
-    /// @notice Returns the address of the Token Descriptor, that handles generating token URIs for Positions
-    function tokenDescriptor() external view returns (address);
-
-    /// @notice Returns the address of the Owner, that is allowed to set a new TokenDescriptor
-    function owner() external view returns (address);
 
     struct MintParams {
         address token0;
@@ -184,12 +149,4 @@ interface INonfungiblePositionManager is
     /// must be collected first.
     /// @param tokenId The ID of the token that is being burned
     function burn(uint256 tokenId) external payable;
-
-    /// @notice Sets a new Token Descriptor
-    /// @param _tokenDescriptor Address of the new Token Descriptor to be chosen
-    function setTokenDescriptor(address _tokenDescriptor) external;
-
-    /// @notice Sets a new Owner address
-    /// @param _owner Address of the new Owner to be chosen
-    function setOwner(address _owner) external;
 }

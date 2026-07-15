@@ -7,18 +7,7 @@ import "../inheritance/ControllableInit.sol";
 
 contract BaseUpgradeableStrategyCLStorage is ControllableInit {
 
-  event ProfitsNotCollected(
-      address indexed rewardToken,
-      bool sell,
-      bool floor
-  );
   event ProfitLogInReward(
-      address indexed rewardToken,
-      uint256 profitAmount,
-      uint256 feeAmount,
-      uint256 timestamp
-  );
-  event ProfitAndBuybackLog(
       address indexed rewardToken,
       uint256 profitAmount,
       uint256 feeAmount,
@@ -42,9 +31,7 @@ contract BaseUpgradeableStrategyCLStorage is ControllableInit {
   bytes32 internal constant _VAULT_SLOT = 0xefd7c7d9ef1040fc87e7ad11fe15f86e1d11e1df03c6d7c87f7e1f4041f08d41;
 
   bytes32 internal constant _REWARD_TOKEN_SLOT = 0xdae0aafd977983cb1e78d8f638900ff361dc3c48c43118ca1dd77d1af3f47bbf;
-  bytes32 internal constant _REWARD_TOKENS_SLOT = 0x45418d9b5c2787ae64acbffccad43f2b487c1a16e24385aa9d2b059f9d1d163c;
   bytes32 internal constant _REWARD_POOL_SLOT = 0x3d9bb16e77837e25cada0cf894835418b38e8e18fbec6cfd192eb344bebfa6b8;
-  bytes32 internal constant _SELL_FLOOR_SLOT = 0xc403216a7704d160f6a3b5c3b149a1226a6080f0a5dd27b27d9ba9c022fa0afc;
   bytes32 internal constant _SELL_SLOT = 0x656de32df98753b07482576beb0d00a6b949ebf84c066c765f54f26725221bb6;
   bytes32 internal constant _PAUSED_INVESTING_SLOT = 0xa07a20a2d463a602c2b891eb35f244624d9068572811f63d0e094072fb54591a;
 
@@ -57,9 +44,7 @@ contract BaseUpgradeableStrategyCLStorage is ControllableInit {
     assert(_VAULT_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.vault")) - 1));
 
     assert(_REWARD_TOKEN_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.rewardToken")) - 1));
-    assert(_REWARD_TOKENS_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.rewardTokens")) - 1));
     assert(_REWARD_POOL_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.rewardPool")) - 1));
-    assert(_SELL_FLOOR_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.sellFloor")) - 1));
     assert(_SELL_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.sell")) - 1));
     assert(_PAUSED_INVESTING_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.pausedInvesting")) - 1));
 
@@ -83,27 +68,6 @@ contract BaseUpgradeableStrategyCLStorage is ControllableInit {
 
   function rewardToken() public view returns (address) {
     return getAddress(_REWARD_TOKEN_SLOT);
-  }
-
-  function _setRewardTokens(address[] memory _rewardTokens) internal {
-    setAddressArray(_REWARD_TOKENS_SLOT, _rewardTokens);
-  }
-
-  function isRewardToken(address _token) public view returns (bool) {
-    return _isAddressInList(_token, rewardTokens());
-  }
-
-  function rewardTokens() public view returns (address[] memory) {
-      return getAddressArray(_REWARD_TOKENS_SLOT);
-  }
-
-  function _isAddressInList(address _searchValue, address[] memory _list) internal pure returns (bool) {
-    for (uint i = 0; i < _list.length; i++) {
-      if (_list[i] == _searchValue) {
-        return true;
-      }
-    }
-    return false;
   }
 
   function _setStrategist(address _strategist) internal {
@@ -138,18 +102,6 @@ contract BaseUpgradeableStrategyCLStorage is ControllableInit {
     return ICLVault(vault()).token1();
   }
 
-  function tickSpacing() public view returns (int24) {
-    return ICLVault(vault()).tickSpacing();
-  }
-
-  function tickLower() public view returns (int24) {
-    return ICLVault(vault()).tickLower();
-  }
-
-  function tickUpper() public view returns (int24) {
-    return ICLVault(vault()).tickUpper();
-  }
-
   // a flag for disabling selling for simplified emergency exit
   function _setSell(bool _value) internal {
     setBoolean(_SELL_SLOT, _value);
@@ -165,14 +117,6 @@ contract BaseUpgradeableStrategyCLStorage is ControllableInit {
 
   function pausedInvesting() public view returns (bool) {
     return getBoolean(_PAUSED_INVESTING_SLOT);
-  }
-
-  function _setSellFloor(uint256 _value) internal {
-    setUint256(_SELL_FLOOR_SLOT, _value);
-  }
-
-  function sellFloor() public view returns (uint256) {
-    return getUint256(_SELL_FLOOR_SLOT);
   }
 
   function profitSharingNumerator() public view returns (uint256) {
@@ -253,49 +197,8 @@ contract BaseUpgradeableStrategyCLStorage is ControllableInit {
     }
   }
 
-  function setUint256Array(bytes32 slot, uint256[] memory _values) internal {
-    // solhint-disable-next-line no-inline-assembly
-    setUint256(slot, _values.length);
-    for (uint i = 0; i < _values.length; i++) {
-        setUint256(bytes32(uint(slot) + 1 + i), _values[i]);
-    }
-  }
-
-  function setAddressArray(bytes32 slot, address[] memory _values) internal {
-    // solhint-disable-next-line no-inline-assembly
-    setUint256(slot, _values.length);
-    for (uint i = 0; i < _values.length; i++) {
-        setAddress(bytes32(uint(slot) + 1 + i), _values[i]);
-    }
-  }
-
-  function getUint256Array(bytes32 slot) internal view returns (uint[] memory values) {
-    // solhint-disable-next-line no-inline-assembly
-    values = new uint[](getUint256(slot));
-    for (uint i = 0; i < values.length; i++) {
-        values[i] = getUint256(bytes32(uint(slot) + 1 + i));
-    }
-  }
-
-  function getAddressArray(bytes32 slot) internal view returns (address[] memory values) {
-    // solhint-disable-next-line no-inline-assembly
-    values = new address[](getUint256(slot));
-    for (uint i = 0; i < values.length; i++) {
-        values[i] = getAddress(bytes32(uint(slot) + 1 + i));
-    }
-  }
-
-  function setBytes32(bytes32 slot, bytes32 _value) internal {
-    // solhint-disable-next-line no-inline-assembly
-    assembly {
-    sstore(slot, _value)
-    }
-  }
-
-  function getBytes32(bytes32 slot) internal view returns (bytes32 str) {
-    // solhint-disable-next-line no-inline-assembly
-    assembly {
-    str := sload(slot)
-    }
-  }
+  // Reserved storage gap for upgrade safety. Matches the pattern used elsewhere
+  // in the codebase (e.g. BaseUpgradeableStrategyStorage / CLVaultStorage). Future
+  // additions to this base must consume slots from the gap, not push child state.
+  uint256[50] private ______gap;
 }

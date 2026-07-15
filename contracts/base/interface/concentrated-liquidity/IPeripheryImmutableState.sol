@@ -6,7 +6,4 @@ pragma solidity 0.8.26;
 interface IPeripheryImmutableState {
     /// @return Returns the address of the CL factory
     function factory() external view returns (address);
-
-    /// @return Returns the address of WETH9
-    function WETH9() external view returns (address);
 }
