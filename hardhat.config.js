@@ -102,6 +102,26 @@ module.exports = {
           },
         },
       },
+      // The Aave 2-asset fold strategy is deployable only WITHOUT viaIR: at
+      // runs:1 the IR pipeline inflates its bytecode past the 24576-byte EIP-170
+      // limit (~25.8KB), while the legacy pipeline keeps it comfortably under.
+      // Override the whole fold compilation unit so it builds consistently.
+      "contracts/strategies/aave/fold/Aave2AssetFoldStrategyMainnet_ETH_cbETH.sol": {
+        version: "0.8.26",
+        settings: { optimizer: { enabled: true, runs: 1 }, viaIR: false },
+      },
+      "contracts/strategies/aave/fold/Aave2AssetFoldStrategy_debtDenom.sol": {
+        version: "0.8.26",
+        settings: { optimizer: { enabled: true, runs: 1 }, viaIR: false },
+      },
+      "contracts/strategies/aave/fold/AaveReserveLib.sol": {
+        version: "0.8.26",
+        settings: { optimizer: { enabled: true, runs: 1 }, viaIR: false },
+      },
+      "contracts/strategies/aave/fold/AaveViewer.sol": {
+        version: "0.8.26",
+        settings: { optimizer: { enabled: true, runs: 1 }, viaIR: false },
+      },
     },
   },
   mocha: {
