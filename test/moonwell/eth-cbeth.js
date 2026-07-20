@@ -9,7 +9,7 @@ const {
 const addresses = require("../test-config.js");
 const BigNumber = require("bignumber.js");
 const IERC20 = artifacts.require("IERC20");
-const Vault = artifacts.require("VaultV2");
+const Vault = artifacts.require("FoldVaultV2");
 
 //const Strategy = artifacts.require("");
 const Strategy = artifacts.require("Moonwell2AssetFoldStrategyMainnet_ETH_cbETH");

@@ -16,12 +16,13 @@ import "./VaultStorage.sol";
 import "./interface/IERC4626.sol";
 
 /**
- * @title VaultV1
- * @dev Yield-optimizing vault with a customizable strategy, supporting deposit, withdrawal, and upgrades.
- * Provides automated reinvestment and governance-controlled parameters.
- * Inherits from `ControllableInit` for governance and controller access, and `VaultStorage` for underlying asset management.
+ * @title FoldVaultV1
+ * @dev Looping-strategy variant of VaultV1. Identical to the base vault except
+ * that its deposit/withdraw path accrues fees via `preInteract()`, supports a
+ * marginal `doHardWorkOnDeposit()` hook, and enforces an optional governance
+ * deposit cap. The base `VaultV1` is intentionally left untouched (== master).
  */
-contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultStorage {
+contract FoldVaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultStorage {
   using SafeERC20Upgradeable for IERC20Upgradeable;
   using AddressUpgradeable for address;
   using SafeMathUpgradeable for uint256;
@@ -29,8 +30,24 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
   event Invest(uint256 amount);
   event StrategyAnnounced(address newStrategy, uint256 time);
   event StrategyChanged(address newStrategy, address oldStrategy);
+  event DepositCapChanged(uint256 oldCap, uint256 newCap);
 
-  constructor() {}
+  // Optional deposit cap, denominated in underlying (0 = uncapped). An extra
+  // storage slot on top of the base VaultStorage ones; only the looping vault
+  // carries it, so the shared VaultStorage stays exactly as on master.
+  bytes32 internal constant _DEPOSIT_CAP_SLOT = 0xd835bdd7ad461b0c86e99a3d099e26b9deeba4c35acaddbb2e0d9d5b3aa58781;
+
+  constructor() {
+    assert(_DEPOSIT_CAP_SLOT == bytes32(uint256(keccak256("eip1967.vaultStorage.depositCap")) - 1));
+  }
+
+  function _setDepositCap(uint256 _value) internal {
+    setUint256(_DEPOSIT_CAP_SLOT, _value);
+  }
+
+  function _depositCap() internal view returns (uint256) {
+    return getUint256(_DEPOSIT_CAP_SLOT);
+  }
 
   /**
    * @notice Initializes the vault with the specified underlying asset and investment parameters.
@@ -155,6 +172,23 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
 
   function compoundOnWithdraw() public view returns (bool) {
     return _compoundOnWithdraw();
+  }
+
+  /**
+   * @notice Sets a cap on total deposits, denominated in the underlying asset.
+   * A cap of 0 means uncapped. Effective immediately (no timelock).
+   * @param cap Maximum total underlying the vault may hold; 0 disables the cap.
+   */
+  function setDepositCap(uint256 cap) external onlyGovernance {
+    emit DepositCapChanged(_depositCap(), cap);
+    _setDepositCap(cap);
+  }
+
+  /**
+   * @notice Returns the deposit cap in underlying (0 means uncapped).
+   */
+  function depositCap() public view returns (uint256) {
+    return _depositCap();
   }
 
   modifier whenStrategyDefined() {
@@ -384,19 +418,41 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
     require(amount > 0, "Cannot deposit 0");
     require(beneficiary != address(0), "holder must be defined");
 
+    address _strategy = strategy();
+    uint256 totalSupplyBefore = totalSupply();
+    IStrategy(_strategy).preInteract();
+    uint256 balanceBefore = underlyingBalanceWithInvestment();
+
+    // Enforce the optional deposit cap (denominated in underlying); 0 = uncapped.
+    // Checked before pulling funds, against the pre-deposit TVL plus this deposit.
+    uint256 cap = depositCap();
+    require(cap == 0 || balanceBefore.add(amount) <= cap, "Deposit cap reached");
+
     IERC20Upgradeable(underlying()).safeTransferFrom(sender, address(this), amount);
-    
     if (investOnDeposit()) {
       invest();
-      IStrategy(strategy()).doHardWork();
+      // Strategies that support immediate marginal investing can implement a dedicated
+      // deposit hook so the depositor bears only their own entry cost.
+      (bool success, bytes memory data) = _strategy.call(abi.encodeWithSignature("doHardWorkOnDeposit()"));
+      if (!success) {
+        if (data.length > 0) {
+          assembly {
+            revert(add(data, 32), mload(data))
+          }
+        }
+        IStrategy(_strategy).doHardWork();
+      }
     }
 
-    uint256 toMint = totalSupply() == 0
-        ? amount
-        : amount.mul(totalSupply()).div(underlyingBalanceWithInvestment().sub(amount));
+    uint256 balanceAfter = underlyingBalanceWithInvestment();
+    uint256 actualAmount = balanceAfter.sub(balanceBefore);
+
+    uint256 toMint = totalSupplyBefore == 0
+        ? actualAmount
+        : actualAmount.mul(totalSupplyBefore).div(balanceBefore);
     _mint(beneficiary, toMint);
 
-    emit IERC4626.Deposit(sender, beneficiary, amount, toMint);
+    emit IERC4626.Deposit(sender, beneficiary, actualAmount, toMint);
     return toMint;
   }
 
@@ -410,7 +466,7 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
   function _withdraw(uint256 numberOfShares, address receiver, address owner) internal returns (uint256) {
     require(totalSupply() > 0, "Vault has no shares");
     require(numberOfShares > 0, "numberOfShares must be greater than 0");
-    uint256 totalSupply = totalSupply();
+    uint256 totalSupplyBefore = totalSupply();
 
     address sender = msg.sender;
     if (sender != owner) {
@@ -420,25 +476,39 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
         _approve(owner, sender, currentAllowance - numberOfShares);
       }
     }
-    _burn(owner, numberOfShares);
+
+    address _strategy = strategy();
+    IStrategy(_strategy).preInteract();
 
     if (compoundOnWithdraw()) {
-      IStrategy(strategy()).doHardWork();
+      IStrategy(_strategy).doHardWork();
     }
 
-    uint256 underlyingAmountToWithdraw = underlyingBalanceWithInvestment()
+    uint256 assetsBefore = underlyingBalanceWithInvestment();
+    _burn(owner, numberOfShares);
+
+    uint256 underlyingAmountToWithdraw = assetsBefore
         .mul(numberOfShares)
-        .div(totalSupply);
+        .div(totalSupplyBefore);
     if (underlyingAmountToWithdraw > underlyingBalanceInVault()) {
-      if (numberOfShares == totalSupply) {
-        IStrategy(strategy()).withdrawAllToVault();
+      if (numberOfShares == totalSupplyBefore) {
+        IStrategy(_strategy).withdrawAllToVault();
       } else {
         uint256 missing = underlyingAmountToWithdraw.sub(underlyingBalanceInVault());
-        IStrategy(strategy()).withdrawToVault(missing);
+        IStrategy(_strategy).withdrawToVault(missing);
       }
-      underlyingAmountToWithdraw = MathUpgradeable.min(underlyingBalanceWithInvestment()
-          .mul(numberOfShares)
-          .div(totalSupply), underlyingBalanceInVault());
+    }
+
+    uint256 remainingShares = totalSupplyBefore.sub(numberOfShares);
+    uint256 assetsAfter = underlyingBalanceWithInvestment();
+    if (remainingShares == 0) {
+      underlyingAmountToWithdraw = underlyingBalanceInVault();
+    } else {
+      uint256 targetRemainingAssets = assetsBefore
+          .mul(remainingShares)
+          .div(totalSupplyBefore);
+      underlyingAmountToWithdraw = assetsAfter.sub(targetRemainingAssets);
+      underlyingAmountToWithdraw = MathUpgradeable.min(underlyingAmountToWithdraw, underlyingBalanceInVault());
     }
 
     IERC20Upgradeable(underlying()).safeTransfer(receiver, underlyingAmountToWithdraw);

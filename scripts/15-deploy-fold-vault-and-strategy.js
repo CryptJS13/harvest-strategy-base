@@ -11,13 +11,19 @@ async function main() {
 
   const {underlyingAddr, strategyName} = await prompt.get(['underlyingAddr', 'strategyName']);
 
+  // Looping strategies use FoldVaultV2 (base vault + preInteract fee accrual,
+  // doHardWorkOnDeposit hook, and the optional deposit cap). The base VaultV1/V2
+  // are intentionally left as-is; deploy a dedicated FoldVaultV2 implementation.
+  const FoldVaultV2 = artifacts.require('FoldVaultV2');
+  const vaultImpl = await type2Transaction(FoldVaultV2.new);
+  console.log("FoldVaultV2 implementation deployed at:", vaultImpl.creates);
+
   const VaultProxy = artifacts.require('VaultProxy');
-  const proxy = await type2Transaction(VaultProxy.new, addresses.FoldVaultImplementation);
+  const proxy = await type2Transaction(VaultProxy.new, vaultImpl.creates);
 
   console.log("Proxy deployed at:", proxy.creates);
 
-  const VaultV2 = artifacts.require('VaultV2');
-  const vault = await VaultV2.at(proxy.creates);
+  const vault = await FoldVaultV2.at(proxy.creates);
   await type2Transaction(vault.initializeVault, addresses.Storage, underlyingAddr, 100, 100);
 
   console.log("New vault deployed and initialised at", proxy.creates);
