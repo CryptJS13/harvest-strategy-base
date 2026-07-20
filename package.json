@@ -24,7 +24,7 @@
     "@nomiclabs/hardhat-waffle": "2.0.6",
     "@openzeppelin/test-helpers": "0.5.16",
     "dotenv": "^16.4.5",
-    "hardhat": "^2.26.1",
+    "hardhat": "2.26.3",
     "hardhat-gas-reporter": "^2.3.0"
   },
   "dependencies": {
