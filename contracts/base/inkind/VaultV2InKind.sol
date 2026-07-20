@@ -14,7 +14,7 @@ interface IInKindStrategy {
     function previewWithdrawInKind(uint256 shareNumerator, uint256 shareDenominator) external view returns (uint256);
     function syncBalance() external;
     function syncedInvestedUnderlyingBalance() external view returns (uint256);
-    function eulerVault() external view returns (address);
+    function rewardPool() external view returns (address);
 }
 
 /**
@@ -132,7 +132,7 @@ contract VaultV2InKind is IERC4626, VaultV1 {
      * @notice The lending pool share token paid out by `redeemInKind`.
      */
     function inKindToken() public view returns (address) {
-        return IInKindStrategy(strategy()).eulerVault();
+        return IInKindStrategy(strategy()).rewardPool();
     }
 
     /**
