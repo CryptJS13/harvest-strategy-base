@@ -1,9 +1,9 @@
 //SPDX-License-Identifier: Unlicense
 pragma solidity 0.8.26;
 
-import "../euler/EulerLendStrategy.sol";
+import "./FortyAcresLendStrategy.sol";
 
-contract FortyAcresLendStrategyMainnet_USDC is EulerLendStrategy {
+contract FortyAcresLendStrategyMainnet_USDC is FortyAcresLendStrategy {
 
   constructor() {}
 

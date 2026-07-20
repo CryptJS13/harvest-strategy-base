@@ -380,7 +380,7 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
    * @param beneficiary Address to receive the shares.
    * @return Amount of shares minted.
    */
-  function _deposit(uint256 amount, address sender, address beneficiary) internal returns (uint256) {
+  function _deposit(uint256 amount, address sender, address beneficiary) internal virtual returns (uint256) {
     require(amount > 0, "Cannot deposit 0");
     require(beneficiary != address(0), "holder must be defined");
 
@@ -407,7 +407,7 @@ contract VaultV1 is ERC20Upgradeable, IUpgradeSource, ControllableInit, VaultSto
    * @param owner Address holding the shares to redeem.
    * @return Amount of underlying assets received.
    */
-  function _withdraw(uint256 numberOfShares, address receiver, address owner) internal returns (uint256) {
+  function _withdraw(uint256 numberOfShares, address receiver, address owner) internal virtual returns (uint256) {
     require(totalSupply() > 0, "Vault has no shares");
     require(numberOfShares > 0, "numberOfShares must be greater than 0");
     uint256 totalSupply = totalSupply();
