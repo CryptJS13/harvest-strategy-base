@@ -93,7 +93,7 @@ contract MorphoVaultV2Strategy is BaseUpgradeableStrategy {
   function _handleFee() internal {
     _accrueFee();
     uint256 fee = pendingFee();
-    if (fee > 1e13) {
+    if (fee > 1e4) {
       _redeem(fee);
       address _underlying = underlying();
       fee = Math.min(fee, IERC20(_underlying).balanceOf(address(this)));
@@ -169,7 +169,7 @@ contract MorphoVaultV2Strategy is BaseUpgradeableStrategy {
       if (token == _rewardToken) continue;
       _syncRewardStream(token);
       uint256 toSell = _pullClaimable(token);
-      if (toSell > 0){
+      if (toSell > 1e12) {
         IERC20(token).safeApprove(_universalLiquidator, 0);
         IERC20(token).safeApprove(_universalLiquidator, toSell);
         IUniversalLiquidator(_universalLiquidator).swap(token, _rewardToken, toSell, 1, address(this));
