@@ -35,7 +35,7 @@ const addresses = require("../../test-config.js");
 const IERC20 = artifacts.require("IERC20");
 const IPool = artifacts.require("contracts/base/interface/aave/IPool.sol:IPool");
 const IUniversalLiquidator = artifacts.require("IUniversalLiquidator");
-const Vault = artifacts.require("VaultV2");
+const Vault = artifacts.require("FoldVaultV2");
 const Strategy = artifacts.require("Aave2AssetFoldStrategyMainnet_ETH_cbETH");
 
 const POOL_CONFIGURATOR_ABI = [

@@ -10,7 +10,7 @@ const addresses = require("../../test-config.js");
 
 const IERC20 = artifacts.require("IERC20");
 const IWETH = artifacts.require("contracts/base/interface/weth/IWETH.sol:IWETH");
-const Vault = artifacts.require("VaultV2");
+const Vault = artifacts.require("FoldVaultV2");
 const Strategy = artifacts.require("Aave2AssetFoldStrategyMainnet_ETH_cbETH");
 const MockAaveViewer = artifacts.require("MockAaveViewer");
 const MockUniversalLiquidator = artifacts.require("MockUniversalLiquidator");
