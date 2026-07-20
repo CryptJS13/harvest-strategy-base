@@ -7,7 +7,17 @@
     "test": "test"
   },
   "scripts": {
-    "test": "echo \"Error: please run tests individually\" && exit 1"
+    "test": "echo \"Error: please run tests individually\" && exit 1",
+    "node:check24": "node scripts/preflight/check-node-major.js 24",
+    "test:cl:tbtc:fixed": "npm run node:check24 && FORK_BLOCK=32897925 npx hardhat test test/aeroCL/tbtc-cbbtc1.js",
+    "test:cl:invariants": "npm run node:check24 && FORK_BLOCK=32897925 npx hardhat test test/aeroCL/invariants.js",
+    "test:cl:stress": "npm run node:check24 && FORK_BLOCK=32897925 npx hardhat test test/aeroCL/stress-fuzz.js",
+    "test:cl:adversarial": "npm run node:check24 && FORK_BLOCK=32897925 npx hardhat test test/aeroCL/rebalance-adversarial.js",
+    "test:cl:baseline": "npm run node:check24 && FORK_BLOCK=32897925 npx hardhat test test/aeroCL/cbeth-eth1.js test/aeroCL/tbtc-cbbtc1.js test/aeroCL/live-controls.js",
+    "size:cl": "npm run node:check24 && npx hardhat size-contracts",
+    "check:size:clvault": "npm run node:check24 && node scripts/preflight/check-clvault-size.js 24576",
+    "check:config:cl": "node scripts/preflight/check-cl-configs.js",
+    "gate:cl": "npm run check:config:cl && npm run test:cl:baseline && npm run test:cl:invariants && npm run test:cl:adversarial && npm run size:cl && npm run check:size:clvault"
   },
   "repository": {
     "type": "git",

@@ -1,5 +1,11 @@
 module.exports = {
   "Storage": "0x98E03c6Ed7374F1e58FF022f1D2D8239526E13F9",
+  // Deployer-governed bridge Storage, deployed once and reused across all subsequent CL
+  // vault deployments to satisfy `onlyGovernance` setters during setup. The deploy script
+  // flips every Controllable away from this and onto the real `Storage` above as its last
+  // step. Leave empty string to force the deploy script to error rather than silently
+  // proceed without a bridge.
+  "SetupStorage": "0x8dE4B34D78B8431d6E9479a99cb21BCc5C50B792",
   "RewardForwarder": "0x4c60e50173A6Bb05Fa4A8BF32fD4EA7e0975D2D8",
   "UniversalLiquidator": "0x589Ff9f1E9f517b232808280c46a64a36Ac557d5",
   "UniversalLiquidatorRegistry": "0x07d212988ECDf8d2c2Ab448114685CE5fDf07a4C",
@@ -9,7 +15,7 @@ module.exports = {
   "iFARM": "0xE7798f023fC62146e8Aa1b36Da45fb70855a77Ea",
   "WETH": "0x4200000000000000000000000000000000000006",
   "VaultImplementation": "0x91CffCc1Fe6B9DA316e8848e141BADB8CD41bA00",
-  "CLVaultImplementation": "0xab128139cbcEDAb336cAFD69163FD78baaEB6dfA",
+  "CLVaultImplementation": "0x8D3a43FB9C56C53e40665d5cdF72ac24E21c93FC",
   "FoldVaultImplementation": "0xe727FeB09515c5EB86BD5F5eBA7F3228252A2e30",
   "CommunityMsig": "0x97b3e5712CDE7Db13e939a188C8CA90Db5B05131",
   "ProfitShare": "0xCD719739C3Ece8b576D649BE97195aD03e676a2c",

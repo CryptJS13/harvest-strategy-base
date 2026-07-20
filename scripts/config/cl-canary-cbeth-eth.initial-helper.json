@@ -1,0 +1,27 @@
+{
+  "name": "canary-cbeth-eth-initial",
+  "addressesPath": "test/test-config.js",
+  "posId": "19447757",
+  "posManager": "0x827922686190790b37229fd06084350E74485b72",
+  "targetWidth": "1",
+  "strategyName": "AerodromeCLStrategyMainnet_cbETH_ETH1",
+  "rebalanceHelper": "0x0000000000000000000000000000000000000000",
+  "deploySharedHelper": true,
+  "rebalance": {
+    "deviation": 0,
+    "cooldown": 3600,
+    "executor": "0x920b1aCb7618B553324aa0F71620226FA2e09870",
+    "maxSwapBps": 2500,
+    "maxSlippageBps": 100,
+    "twapWindow": 900,
+    "maxTwapDeviationBps": 200
+  },
+  "strategy": {
+    "minRewardToCompound": "1"
+  },
+  "wrappers": {
+    "deploy": false
+  },
+  "verify": false,
+  "snapshotPath": "scripts/deployments/cl/canary-cbeth-eth.initial-helper.json"
+}

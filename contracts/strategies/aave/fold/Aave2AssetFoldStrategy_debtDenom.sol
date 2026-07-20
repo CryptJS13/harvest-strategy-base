@@ -3,11 +3,10 @@ pragma solidity 0.8.26;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "../../../base/interface/IUniversalLiquidator.sol";
 import "../../../base/upgradability/BaseUpgradeableStrategy.sol";
 import "../../../base/interface/aave/IAToken.sol";
 import "../../../base/interface/aave/IPool.sol";
-import "./AaveViewer.sol";
+import "./AaveReserveLib.sol";
 
 contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
@@ -15,14 +14,20 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
   enum FlashMode { Deposit, Withdraw }
 
+  // Prices are intentionally NOT carried here: the flashloan callback runs in
+  // the same transaction as the initiator, so the oracle returns identical
+  // prices when re-read there — passing them would only bloat the encoded
+  // params (and the contract) for no behavioural difference.
   struct FlashParams {
     FlashMode mode;
     uint256 redeemAmount;
     uint256 collateralToRedeem;
-    uint256 priceSupplyInBorrow;
-    uint256 priceBorrowInSupply;
   }
 
+  // A single fresh read of the position: both oracle prices (one getPrice read +
+  // its reciprocal), debt, collateral-in-debt-units, and the health factor.
+  // Callers reuse it instead of re-reading; the liquidation threshold is read
+  // separately, only by the two lever paths that need it.
   struct PositionSnap {
     uint256 borrowedDebt;
     uint256 suppliedInDebt;
@@ -31,10 +36,15 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     uint256 health;
   }
 
-  address public constant viewer = address(0x1e51654aB193bA165b7F7715C734dAF454f08148);
-  address public constant harvestMSIG = address(0x97b3e5712CDE7Db13e939a188C8CA90Db5B05131);
-  uint256 public constant BPS = 10_000;
-  uint256 public constant MAX_SLIPPAGE_BPS = 100;
+  address internal constant harvestMSIG = address(0x97b3e5712CDE7Db13e939a188C8CA90Db5B05131);
+  uint256 internal constant BPS = 10_000;
+  uint256 internal constant MAX_SLIPPAGE_BPS = 100;
+  // Safety margin subtracted from a reserve's reported cap headroom before we
+  // size a lever-up against it. Covers reserve.accruedToTreasury (excluded from
+  // the aToken/debtToken totalSupply the headroom is derived from) plus a tick
+  // of per-block interest accrual, so a clamped borrow/supply stays under the
+  // cap rather than reverting at the exact boundary.
+  uint256 internal constant CAP_BUFFER_BPS = 100;
 
   // additional storage slots (on top of BaseUpgradeableStrategy ones) are defined here
   bytes32 internal constant _SUPPLY_ATOKEN_SLOT = 0x245f4d52f8837fdd7cb38b8b771b10e0c2c4eb20f8e39aec533f7dff93021e31;
@@ -107,37 +117,77 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
   function checker() external view returns (bool canExec, bytes memory execPayload) {
     PositionSnap memory s = _snapPosition();
-    uint256 collateralLimit = _effectiveCollateralFactorNumerator();
-    canExec = (
-      fold() &&
-      s.borrowedDebt > 0 &&
-      collateralLimit <= borrowTargetFactorNumerator()
-    ) || s.health < (targetHealth() * 99) / 100;
+    uint256 cl = _effectiveCollateralFactorNumerator();
+    // Only fire when the next hard-work has work to do that can actually
+    // succeed; both branches here are deleverage / repay paths and only need
+    // repay availability (paused borrow side blocks even repay).
+    canExec = (_borrowFlags() & 4 != 0) && (
+      (fold() && s.borrowedDebt > 0 && cl <= borrowTargetFactorNumerator()) ||
+      s.health < (_targetHealthFrom(cl) * 99) / 100
+    );
     execPayload = abi.encodeWithSelector(IController.doHardWork.selector, vault());
   }
 
+  // ---------------------------------------------------------------------------
+  // Aave reserve status guards (bit decoding lives in AaveReserveLib, inlined).
+  //   bit 1 -> borrow available    (borrow side only)
+  //   bit 2 -> supply available    (supply side only)
+  //   bit 4 -> repay/withdraw available (both sides)
+  // Frozen blocks new supply/borrow but allows repay/withdraw. Paused blocks
+  // everything. The strategy reads these on-chain so it auto-recovers without a
+  // tx when Aave reopens the market.
+  // ---------------------------------------------------------------------------
+  function _borrowFlags() internal view returns (uint8) {
+    return AaveReserveLib.borrowFlags(IPool(rewardPool()), underlying(), borrowAToken());
+  }
+
+  function _supplyFlags() internal view returns (uint8) {
+    return AaveReserveLib.supplyFlags(IPool(rewardPool()), supplyAsset(), supplyAToken());
+  }
+
+  // Caps a desired new-debt increase to what both reserves can still absorb
+  // under their supply/borrow caps (minus a safety buffer), so the strategy
+  // levers partway and finishes on a later hard-work instead of reverting the
+  // flashloan at a near-full cap.
+  function _capClampedDebtIncrease(uint256 desired, uint256 priceSupplyInBorrow) internal view returns (uint256) {
+    return AaveReserveLib.capClampedDebtIncrease(
+      IPool(rewardPool()), underlying(), borrowAToken(), supplyAsset(), supplyAToken(),
+      desired, priceSupplyInBorrow, CAP_BUFFER_BPS
+    );
+  }
+
+  // Both oracle prices from a single oracle resolution (reciprocals). Logic in
+  // AaveReserveLib; the delegatecall is warm after the first library touch.
+  function _prices() internal view returns (uint256 priceSupplyInBorrow, uint256 priceBorrowInSupply) {
+    return AaveReserveLib.prices(supplyAsset(), underlying());
+  }
+
   function _snapPosition() internal view returns (PositionSnap memory s) {
-    address _supplyToken = supplyAsset();
-    address _borrowToken = underlying();
-
-    s.priceSupplyInBorrow = AaveViewer(viewer).getPrice(_supplyToken, _borrowToken);
-    s.priceBorrowInSupply = AaveViewer(viewer).getPrice(_borrowToken, _supplyToken);
-    
-    s.borrowedDebt = IERC20(borrowAToken()).balanceOf(address(this));
-    s.suppliedInDebt = (IERC20(supplyAToken()).balanceOf(address(this)) * s.priceSupplyInBorrow) / 1e18;
-
-    s.health = AaveViewer(viewer).getPositionHealth();
+    (s.priceSupplyInBorrow, s.priceBorrowInSupply, s.borrowedDebt, s.suppliedInDebt, s.health) =
+      AaveReserveLib.snap(supplyAsset(), underlying(), supplyAToken(), borrowAToken());
   }
 
   function _currentBalance(PositionSnap memory s) internal pure returns (uint256) {
     return s.suppliedInDebt - s.borrowedDebt;
   }
 
+  // min(configured collateral factor, live Aave liquidation threshold). A
+  // getUserAccountData read; the lever paths call it ONCE and reuse the value
+  // via _targetHealthFrom, so they never read it twice in one operation.
+  function _effectiveCollateralFactorNumerator() internal view returns (uint256) {
+    (,,, uint256 liquidationThreshold,,) = IPool(rewardPool()).getUserAccountData(address(this));
+    return Math.min(collateralFactorNumerator(), liquidationThreshold);
+  }
+
   function targetHealth() public view returns (uint256) {
+    return _targetHealthFrom(_effectiveCollateralFactorNumerator());
+  }
+
+  // targetHealth derived from an already-read effective collateral factor.
+  function _targetHealthFrom(uint256 collateralLimit) internal view returns (uint256) {
     if (!fold() || borrowTargetFactorNumerator() == 0) {
       return type(uint256).max;
     }
-    uint256 collateralLimit = _effectiveCollateralFactorNumerator();
     if (collateralLimit <= borrowTargetFactorNumerator()) {
       return 1e18;
     }
@@ -148,9 +198,12 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     return getUint256(_STORED_BALANCE_SLOT);
   }
 
+  // Recompute the cached net position value. Only needs prices + balances, so
+  // it skips the getUserAccountData a full snap would do.
   function _updateStoredBalance() internal {
-    uint256 balance = _currentBalance(_snapPosition());
-    setUint256(_STORED_BALANCE_SLOT, balance);
+    (uint256 priceSupplyInBorrow,) = _prices();
+    uint256 supplied = (IERC20(supplyAToken()).balanceOf(address(this)) * priceSupplyInBorrow) / 1e18;
+    setUint256(_STORED_BALANCE_SLOT, supplied - IERC20(borrowAToken()).balanceOf(address(this)));
   }
 
   function totalFeeNumerator() public view returns (uint256) {
@@ -176,34 +229,47 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     return s;
   }
 
+  // While folded the preferred path is to pay the fee out of fresh borrow so
+  // the leveraged position is not perturbed. If the borrow market cannot accept
+  // new debt (frozen / paused / capped / no headroom) or there is no
+  // collateral-factor headroom, fall through and pull the fee from collateral
+  // instead. If even withdraw is blocked (paused / inactive collateral) or
+  // there is no collateral to redeem, defer — pendingFee accumulates and
+  // investedUnderlyingBalance() already nets it out of share price.
   function _handleFee() internal {
     PositionSnap memory s = _accrueFee();
     uint256 fee = pendingFee();
-    if (fee <= 0) return;
-    address _underlying = underlying();
-    if (fold()) {
-      if (_effectiveCollateralFactorNumerator() > borrowTargetFactorNumerator() && s.health > targetHealth()){
-        _borrow(fee);
-        fee = Math.min(fee, IERC20(_underlying).balanceOf(address(this)));
-        uint256 balanceIncrease = (fee * feeDenominator()) / totalFeeNumerator();
-        _notifyProfitInRewardToken(_underlying, balanceIncrease);
-        setUint256(_PENDING_FEE_SLOT, pendingFee() - fee);
-        return;
-      }
+    if (fee == 0) return;
+    uint256 cl = _effectiveCollateralFactorNumerator();
+    if (fold() && (_borrowFlags() & 1) != 0
+        && AaveReserveLib.borrowCapHeadroom(IPool(rewardPool()), underlying(), borrowAToken()) >= fee
+        && cl > borrowTargetFactorNumerator()
+        && s.health > _targetHealthFrom(cl)) {
+      // Preferred: pay the fee from fresh borrow so the leveraged position is
+      // not perturbed. Guarded so a partially-filled borrow cap (bit 1 can be
+      // set with < fee of headroom) falls through instead of reverting.
+      _borrow(fee);
     } else {
-      address _supplyAsset = supplyAsset();
-      uint256 toRedeem = fee * s.priceBorrowInSupply / 1e18;
-      toRedeem = (toRedeem * (BPS + slippageBps())) / BPS;
-      _redeem(toRedeem);
-      uint256 collBalance = IERC20(_supplyAsset).balanceOf(address(this));
-      if (collBalance > 0) {
-        _swap(_supplyAsset, _underlying, collBalance, s.priceSupplyInBorrow, s.priceBorrowInSupply);
+      // Fallback: pull the fee from collateral, but ONLY when the collateral
+      // side can service a withdraw AND there is collateral to redeem. If not
+      // (e.g. after emergencyExit the aToken balance is ~0, or the reserve is
+      // paused/inactive), defer: pendingFee stays booked and
+      // investedUnderlyingBalance() already nets it out of share price, so no
+      // value is lost or mis-accounted.
+      address a = supplyAsset();
+      uint256 want = (fee * s.priceBorrowInSupply / 1e18) * (BPS + slippageBps()) / BPS;
+      uint256 redeemable = Math.min(want, IERC20(supplyAToken()).balanceOf(address(this)));
+      if (redeemable > 0 && (_supplyFlags() & 4) != 0) {
+        _redeem(redeemable);
+        uint256 cb = IERC20(a).balanceOf(address(this));
+        if (cb > 0) _swap(a, underlying(), cb, s.priceSupplyInBorrow, s.priceBorrowInSupply);
       }
-      fee = Math.min(fee, IERC20(_underlying).balanceOf(address(this)));
-      uint256 balanceIncrease = (fee * feeDenominator()) / totalFeeNumerator();
-      _notifyProfitInRewardToken(_underlying, balanceIncrease);
-      setUint256(_PENDING_FEE_SLOT, pendingFee() - fee);
     }
+    address u = underlying();
+    fee = Math.min(fee, IERC20(u).balanceOf(address(this)));
+    if (fee == 0) return;
+    _notifyProfitInRewardToken(u, fee * feeDenominator() / totalFeeNumerator());
+    setUint256(_PENDING_FEE_SLOT, pendingFee() - fee);
   }
 
   function depositArbCheck() public pure returns (bool) {
@@ -222,29 +288,34 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
   /**
   * The strategy invests by supplying the underlying as a collateral.
+  *
+  * If the collateral side cannot accept new supply (frozen / paused / cap full)
+  * the fresh underlying stays in the strategy contract; investedUnderlyingBalance()
+  * already counts strategy-held underlying, so vault accounting is unaffected and
+  * the funds get re-attempted on the next hard work.
   */
   function _investAllUnderlying() internal onlyNotPausedInvesting {
     address _underlying = underlying();
     uint256 underlyingBalance = IERC20(_underlying).balanceOf(address(this));
 
-    if (underlyingBalance > 0) {
+    if (underlyingBalance > 0 && (_supplyFlags() & 2 != 0)) {
       PositionSnap memory s = _snapPosition();
       address _supplyAsset = supplyAsset();
       _swap(_underlying, _supplyAsset, underlyingBalance, s.priceSupplyInBorrow, s.priceBorrowInSupply);
       _supply(IERC20(_supplyAsset).balanceOf(address(this)));
     }
     if (fold()) {
-      PositionSnap memory s2 = _snapPosition();
-      _depositWithFlashloan(s2);
+      _depositWithFlashloan(_snapPosition());
     }
   }
 
   function _investUserUnderlying() internal onlyNotPausedInvesting {
     address _underlying = underlying();
     uint256 underlyingBalance = IERC20(_underlying).balanceOf(address(this));
-    if (underlyingBalance == 0) {
-      return;
-    }
+    // If we cannot supply collateral, leave the deposit as idle underlying
+    // in the strategy; investedUnderlyingBalance() counts it and the next
+    // hard-work picks it up once the collateral side reopens.
+    if (underlyingBalance == 0 || (_supplyFlags() & 2 == 0)) return;
 
     PositionSnap memory beforeSnap = _snapPosition();
     uint256 balanceBefore = _currentBalance(beforeSnap);
@@ -260,19 +331,50 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   }
 
   /**
-  * Exits Moonwell and transfers everything to the vault.
+  * Exits the leveraged position and returns everything to the vault.
   */
   function withdrawAllToVault() public restricted {
     address _underlying = underlying();
     _withdrawMaximum(true);
-    if (IERC20(_underlying).balanceOf(address(this)) > 0) {
-      IERC20(_underlying).safeTransfer(vault(), IERC20(_underlying).balanceOf(address(this)) - pendingFee());
+    uint256 bal = IERC20(_underlying).balanceOf(address(this));
+    // Keep any still-pending fee behind; clamp so a residual pendingFee larger
+    // than the realized balance can never underflow-revert the transfer.
+    uint256 reserved = Math.min(bal, pendingFee());
+    if (bal > reserved) {
+      IERC20(_underlying).safeTransfer(vault(), bal - reserved);
     }
     _updateStoredBalance();
   }
 
   function emergencyExit() external onlyGovernance {
     _withdrawMaximum(false);
+    _updateStoredBalance();
+  }
+
+  /**
+  * Manual non-flashloan deleverage step. Withdraws `collateralAmount` of
+  * supplyAsset from Aave, swaps it for the underlying through the universal
+  * liquidator, and repays the proceeds against the strategy's debt. Does
+  * not use a flashloan, so it is the recovery path when the borrow pool's
+  * liquidity is exhausted (a flashloan can't pull the underlying out of an
+  * over-utilised pool). Does NOT work when either reserve is paused — pause
+  * blocks repay/withdraw and there is no on-chain workaround for that.
+  *
+  * Aave rejects withdrawals that would push the position below HF=1, so
+  * the call reverts cleanly when the chunk is too large; governance
+  * retries with a smaller value. Repeat until debt is zero or the position
+  * is at target. storedBalance is resynced at the end so any leftover idle
+  * underlying is not double-counted by investedUnderlyingBalance() before the
+  * next hard-work.
+  */
+  function manualDeleverStep(uint256 collateralAmount) external onlyGovernance {
+    AaveReserveLib.manualDeleverStep(
+      rewardPool(), universalLiquidator(),
+      supplyAsset(), underlying(), borrowAToken(),
+      slippageBps(), collateralAmount
+    );
+    // Resync the cached position value so NAV/pricePerShare reflects the
+    // shrunken position immediately (the step lowers it, so no fee accrues).
     _updateStoredBalance();
   }
 
@@ -287,7 +389,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
   function withdrawToVault(uint256 amountUnderlying) external restricted {
     PositionSnap memory s = _accrueFee();
-    
+
     address _underlying = underlying();
     uint256 balance = IERC20(_underlying).balanceOf(address(this));
     if (amountUnderlying <= balance) {
@@ -326,13 +428,6 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     _updateStoredBalance();
   }
 
-  /**
-  * Redeems maximum that can be redeemed from Venus.
-  * Redeem the minimum of the underlying we own, and the underlying that the vToken can
-  * immediately retrieve. Ensures that `redeemMaximum` doesn't fail silently.
-  *
-  * DOES NOT ensure that the strategy vUnderlying balance becomes 0.
-  */
   function _redeemMaximum() internal {
     _redeemMaximumWithFlashloan();
   }
@@ -341,15 +436,11 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   * Redeems `amountUnderlying` or fails.
   */
   function _redeemPartial(uint256 amountUnderlying, PositionSnap memory s) internal {
-    // address _underlying = underlying();
-    // uint256 balanceBefore = IERC20(_underlying).balanceOf(address(this));
     _redeemWithFlashloan(
       amountUnderlying,
       fold()? borrowTargetFactorNumerator():0,
       s
     );
-    // uint256 balanceAfter = IERC20(_underlying).balanceOf(address(this));
-    // require(balanceAfter - balanceBefore >= amountUnderlying, "with amt");
   }
 
   /**
@@ -366,11 +457,11 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   */
   function investedUnderlyingBalance() public view returns (uint256) {
     address _supplyAsset = supplyAsset();
-    address _borrowAsset = underlying();
-    uint256 balance = IERC20(_borrowAsset).balanceOf(address(this));
+    uint256 balance = IERC20(underlying()).balanceOf(address(this));
     uint256 supplyBalance = IERC20(_supplyAsset).balanceOf(address(this));
     if (supplyBalance > 0) {
-      supplyBalance = supplyBalance * AaveViewer(viewer).getPrice(_supplyAsset, _borrowAsset) / 1e18;
+      (uint256 priceSupplyInBorrow,) = _prices();
+      supplyBalance = (supplyBalance * priceSupplyInBorrow) / 1e18;
     }
     return balance + supplyBalance + storedBalance() - pendingFee();
   }
@@ -407,7 +498,6 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     IPool(rewardPool()).withdraw(supplyAsset(), amountUnderlying, address(this));
   }
 
-
   function _repay(uint256 amountUnderlying) internal {
     if (amountUnderlying == 0){
       return;
@@ -424,26 +514,39 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
 
     address _supplyAsset = supplyAsset();
     address _supplyAToken = supplyAToken();
-    
-    uint256 availableColl = IERC20(_supplyAsset).balanceOf(_supplyAToken);
-    uint256 availableDebt = availableColl * s.priceSupplyInBorrow / 1e18;
+
+    // A full unwind must withdraw the ENTIRE collateral position (value
+    // suppliedInDebt). If the reserve does not hold enough liquid collateral
+    // for that, unwind only the fraction its liquidity supports — proportionally,
+    // so HF stays put — and leave the remainder for a later call or
+    // manualDeleverStep. This avoids the all-or-nothing revert the old
+    // full-debt flashloan hit when collateral liquidity was short.
+    uint256 availableInDebt = IERC20(_supplyAsset).balanceOf(_supplyAToken) * s.priceSupplyInBorrow / 1e18;
+    if (s.suppliedInDebt > 0 && availableInDebt < s.suppliedInDebt) {
+      // equity * (liquidity / total-collateral), buffered a hair under the
+      // liquidity boundary so the collateral withdraw stays serviceable.
+      uint256 feasible = (_currentBalance(s) * availableInDebt) / s.suppliedInDebt;
+      feasible = (feasible * (BPS - slippageBps())) / BPS;
+      if (feasible > 0) {
+        _redeemProportionalWithFlashloan(feasible, s);
+      }
+      // Debt remains, so we must NOT withdraw further unencumbered collateral
+      // here (that would lower HF); the mop-up below is only safe post full unwind.
+      return;
+    }
 
     uint256 balDebt = _currentBalance(s) - pendingFee();
-    uint256 maxDebtOut = Math.min(availableDebt, balDebt);
-
-    _redeemWithFlashloan(maxDebtOut, 0, s);
-    uint256 supplied = IERC20(_supplyAToken).balanceOf(address(this));
-    availableColl = IERC20(_supplyAsset).balanceOf(_supplyAToken);
-    uint256 maxOut = Math.min(supplied, availableColl);
+    _redeemWithFlashloan(balDebt, 0, s);
+    // Debt is now fully repaid; mop up any leftover (now unencumbered) collateral.
+    uint256 maxOut = Math.min(
+      IERC20(_supplyAToken).balanceOf(address(this)),
+      IERC20(_supplyAsset).balanceOf(_supplyAToken)
+    );
     if (maxOut > 0) {
       _redeem(maxOut);
-      _swap(
-        _supplyAsset,
-        underlying(),
+      _swap(_supplyAsset, underlying(),
         IERC20(_supplyAsset).balanceOf(address(this)),
-        s.priceSupplyInBorrow,
-        s.priceBorrowInSupply
-      );
+        s.priceSupplyInBorrow, s.priceBorrowInSupply);
     }
   }
 
@@ -462,43 +565,37 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
       return;
     }
 
-    uint256 _targetHealth = targetHealth();
-    if (s.health < (_targetHealth * 99) / 100) {
+    uint256 th = _targetHealthFrom(collateralLimit);
+    if (s.health < (th * 99) / 100) {
       _redeemPartial(0, s);
       return;
     }
-    if (s.health < (_targetHealth * 101) / 100) {
+    if (s.health < (th * 101) / 100) {
       _handleDust(s);
       return;
     }
 
-    uint256 balance = _currentBalance(s);
-    uint256 borrowTarget = (balance * _borrowNum) / (BPS - _borrowNum);
-    
-    uint256 borrowDiff = 0;
-    if (borrowTarget > s.borrowedDebt) {
-      uint256 desiredDebtIncrease = borrowTarget - s.borrowedDebt;
-      uint256 premiumBps = IPool(rewardPool()).FLASHLOAN_PREMIUM_TOTAL();
-      borrowDiff = premiumBps == 0
-        ? desiredDebtIncrease
-        : (desiredDebtIncrease * BPS) / (BPS + premiumBps);
+    // A lever-up borrows the underlying and supplies collateral, so BOTH legs
+    // must be usable. If either is unavailable (frozen / paused / borrow
+    // disabled / cap full), we cannot lever further. Clean up dust so collateral
+    // that arrived this tx is re-supplied (when possible) and fall through.
+    if ((_borrowFlags() & 1) == 0 || (_supplyFlags() & 2) == 0) {
+      _handleDust(s);
+      return;
     }
 
-    if (borrowDiff > 0) {
-      bytes memory params = abi.encode(FlashParams({
-        mode: FlashMode.Deposit,
-        redeemAmount: 0,
-        collateralToRedeem: 0,
-        priceSupplyInBorrow: s.priceSupplyInBorrow,
-        priceBorrowInSupply: s.priceBorrowInSupply
-      }));
-      IPool(rewardPool()).flashLoanSimple(
-        address(this),
-        underlying(),
-        borrowDiff,
-        params,
-        0
-      );
+    uint256 borrowTarget = (_currentBalance(s) * _borrowNum) / (BPS - _borrowNum);
+    if (borrowTarget > s.borrowedDebt) {
+      // Clamp to the reserves' remaining cap headroom: lever partway now and
+      // finish on a later hard-work rather than reverting at a near-full cap.
+      uint256 desiredDebtIncrease = _capClampedDebtIncrease(borrowTarget - s.borrowedDebt, s.priceSupplyInBorrow);
+      uint256 premiumBps = IPool(rewardPool()).FLASHLOAN_PREMIUM_TOTAL();
+      uint256 borrowDiff = premiumBps == 0
+        ? desiredDebtIncrease
+        : (desiredDebtIncrease * BPS) / (BPS + premiumBps);
+      if (borrowDiff > 0) {
+        _flashLoan(FlashParams({mode: FlashMode.Deposit, redeemAmount: 0, collateralToRedeem: 0}), borrowDiff);
+      }
     }
     _handleDust(s);
   }
@@ -507,83 +604,38 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     uint256 _borrowNum = borrowTargetFactorNumerator();
     uint256 collateralLimit = _effectiveCollateralFactorNumerator();
 
-    if (_borrowNum == 0 || collateralLimit <= _borrowNum) {
-      return;
-    }
-
-    if (s.health < ((targetHealth() * 101) / 100)) {
-      return;
-    }
+    if (_borrowNum == 0 || collateralLimit <= _borrowNum) return;
+    if (s.health < (_targetHealthFrom(collateralLimit) * 101) / 100) return;
+    // A lever-up needs both legs: no fresh debt if borrow is unavailable, no
+    // fresh collateral if supply is. Either way the new equity sits unlevered
+    // until the next hard-work.
+    if ((_borrowFlags() & 1) == 0 || (_supplyFlags() & 2) == 0) return;
 
     uint256 balanceAfter = _currentBalance(s);
-    if (balanceAfter <= balanceBefore) {
-      return;
-    }
+    if (balanceAfter <= balanceBefore) return;
 
     // The marginal deposit should reach the same target leverage as the rest of the book,
-    // but only for the user-added equity realized in this interaction.
-    uint256 addedBalance = balanceAfter - balanceBefore;
-    uint256 borrowDiff = (addedBalance * _borrowNum) / (BPS - _borrowNum);
-    if (borrowDiff == 0) {
-      return;
-    }
-
-    uint256 premiumBps = IPool(rewardPool()).FLASHLOAN_PREMIUM_TOTAL();
-    if (premiumBps > 0) {
-      borrowDiff = (borrowDiff * BPS) / (BPS + premiumBps);
-    }
-    if (borrowDiff == 0) {
-      return;
-    }
-
-    bytes memory params = abi.encode(FlashParams({
-      mode: FlashMode.Deposit,
-      redeemAmount: 0,
-      collateralToRedeem: 0,
-      priceSupplyInBorrow: s.priceSupplyInBorrow,
-      priceBorrowInSupply: s.priceBorrowInSupply
-    }));
-    IPool(rewardPool()).flashLoanSimple(
-      address(this),
-      underlying(),
-      borrowDiff,
-      params,
-      0
+    // but only for the user-added equity realized in this interaction. Clamp to the
+    // reserves' remaining cap headroom so a near-full cap can't revert the deposit.
+    uint256 debtIncrease = _capClampedDebtIncrease(
+      ((balanceAfter - balanceBefore) * _borrowNum) / (BPS - _borrowNum),
+      s.priceSupplyInBorrow
     );
+    uint256 premiumBps = IPool(rewardPool()).FLASHLOAN_PREMIUM_TOTAL();
+    uint256 borrowDiff = premiumBps > 0 ? (debtIncrease * BPS) / (BPS + premiumBps) : debtIncrease;
+    if (borrowDiff == 0) return;
+
+    _flashLoan(FlashParams({mode: FlashMode.Deposit, redeemAmount: 0, collateralToRedeem: 0}), borrowDiff);
   }
 
-  function _redeemWithFlashloan(uint256 amount, uint256 _borrowTargetFactorNumerator, PositionSnap memory s) internal {    
-    uint256 oldBalance = _currentBalance(s);
-    uint256 newBalance = oldBalance - amount;
-
+  function _redeemWithFlashloan(uint256 amount, uint256 _borrowTargetFactorNumerator, PositionSnap memory s) internal {
+    uint256 newBalance = _currentBalance(s) - amount;
     uint256 newBorrowTarget = (newBalance * _borrowTargetFactorNumerator) / (BPS - _borrowTargetFactorNumerator);
-    
-    uint256 borrowDiff = 0;
-    if (s.borrowedDebt > newBorrowTarget) {
-      borrowDiff = s.borrowedDebt - newBorrowTarget;
-    }
-    
-    if (borrowDiff > 0) {
-      bytes memory params = abi.encode(FlashParams({
-        mode: FlashMode.Withdraw,
-        redeemAmount: amount,
-        collateralToRedeem: 0,
-        priceSupplyInBorrow: s.priceSupplyInBorrow,
-        priceBorrowInSupply: s.priceBorrowInSupply
-      }));
-      IPool(rewardPool()).flashLoanSimple(
-        address(this),
-        underlying(),
-        borrowDiff,
-        params,
-        0
-      );
-    } else {
-      uint256 collToRedeem = (amount * s.priceBorrowInSupply) / 1e18;
-      if (collToRedeem > 0) {
-        _redeem(collToRedeem);
-      }
 
+    if (s.borrowedDebt > newBorrowTarget) {
+      _flashLoan(FlashParams({mode: FlashMode.Withdraw, redeemAmount: amount, collateralToRedeem: 0}), s.borrowedDebt - newBorrowTarget);
+    } else {
+      _redeem((amount * s.priceBorrowInSupply) / 1e18);
       address coll = supplyAsset();
       uint256 collBal = IERC20(coll).balanceOf(address(this));
       if (collBal > 0) {
@@ -599,30 +651,13 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
 
     uint256 proportion = (amountUnderlying * 1e18) / positionBalance;
-    if (proportion > 1e18) {
-      proportion = 1e18;
-    }
+    if (proportion > 1e18) proportion = 1e18;
 
-    uint256 borrowed = s.borrowedDebt;
-    uint256 repayAmount = (borrowed * proportion) / 1e18;
-    uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
-    uint256 collateralToRedeem = (supplied * proportion) / 1e18;
+    uint256 repayAmount = (s.borrowedDebt * proportion) / 1e18;
+    uint256 collateralToRedeem = (IERC20(supplyAToken()).balanceOf(address(this)) * proportion) / 1e18;
 
     if (repayAmount > 0) {
-      bytes memory params = abi.encode(FlashParams({
-        mode: FlashMode.Withdraw,
-        redeemAmount: 0,
-        collateralToRedeem: collateralToRedeem,
-        priceSupplyInBorrow: s.priceSupplyInBorrow,
-        priceBorrowInSupply: s.priceBorrowInSupply
-      }));
-      IPool(rewardPool()).flashLoanSimple(
-        address(this),
-        underlying(),
-        repayAmount,
-        params,
-        0
-      );
+      _flashLoan(FlashParams({mode: FlashMode.Withdraw, redeemAmount: 0, collateralToRedeem: collateralToRedeem}), repayAmount);
     } else if (collateralToRedeem > 0) {
       _redeem(collateralToRedeem);
       address coll = supplyAsset();
@@ -633,15 +668,22 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     }
   }
 
+  // Single flashloan entry point shared by every lever/delever path.
+  function _flashLoan(FlashParams memory params, uint256 amount) internal {
+    IPool(rewardPool()).flashLoanSimple(address(this), underlying(), amount, abi.encode(params), 0);
+  }
+
   function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes memory params) external nonReentrant() returns (bool) {
     address _aavePool = rewardPool();
     require(msg.sender == _aavePool, "!pool");
     require(initiator == address(this), "!sender");
     FlashParams memory flashParams = abi.decode(params, (FlashParams));
     uint256 toRepay = amount + premium;
-    
+    // Same tx as the initiator, so the oracle yields the same prices it used.
+    (uint256 priceSupplyInBorrow, uint256 priceBorrowInSupply) = _prices();
+
     if (flashParams.mode == FlashMode.Deposit){
-      _onFlashDeposit(asset, amount, toRepay, flashParams.priceSupplyInBorrow, flashParams.priceBorrowInSupply);
+      _onFlashDeposit(asset, amount, toRepay, priceSupplyInBorrow, priceBorrowInSupply);
     } else {
       _onFlashWithdraw(
         asset,
@@ -649,8 +691,8 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
         toRepay,
         flashParams.redeemAmount,
         flashParams.collateralToRedeem,
-        flashParams.priceSupplyInBorrow,
-        flashParams.priceBorrowInSupply
+        priceSupplyInBorrow,
+        priceBorrowInSupply
       );
     }
 
@@ -676,67 +718,52 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     uint256 priceSupplyInBorrow,
     uint256 priceBorrowInSupply
   ) internal {
-    address _borrowAToken = borrowAToken();
-    uint256 borrowed = IERC20(_borrowAToken).balanceOf(address(this));
-    uint256 repaying = Math.min(amount, borrowed);
-    _repay(repaying);
-    uint256 toRedeem = 0;
+    uint256 borrowed = IERC20(borrowAToken()).balanceOf(address(this));
+    _repay(Math.min(amount, borrowed));
+    uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
+    uint256 toRedeem;
     if (collateralToRedeem > 0) {
-      uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
-      toRedeem = Math.min(collateralToRedeem, supplied);
+      toRedeem = collateralToRedeem;
     } else {
       toRedeem = (toRepay + redeemAmount) * priceBorrowInSupply / 1e18;
       toRedeem = (toRedeem * (BPS + slippageBps())) / BPS;
-      uint256 supplied = IERC20(supplyAToken()).balanceOf(address(this));
-      toRedeem = Math.min(toRedeem, supplied);
     }
+    if (toRedeem > supplied) toRedeem = supplied;
     _redeem(toRedeem);
     address _supplyAsset = supplyAsset();
-    uint256 supplyAssetBalance = IERC20(_supplyAsset).balanceOf(address(this));
-    _swap(_supplyAsset, asset, supplyAssetBalance, priceSupplyInBorrow, priceBorrowInSupply);
+    _swap(_supplyAsset, asset, IERC20(_supplyAsset).balanceOf(address(this)), priceSupplyInBorrow, priceBorrowInSupply);
   }
 
-  function _minOut(
-    address from,
-    address to,
-    uint256 amount,
-    uint256 priceSupplyInBorrow,
-    uint256 priceBorrowInSupply
-  ) internal view returns (uint256) {
-    uint256 bps = BPS - slippageBps();
-    address _underlying = underlying();
-    address _supplyAsset = supplyAsset();
-    if (from == _supplyAsset && to == _underlying) {
-      uint256 oracleOut = (amount * priceSupplyInBorrow) / 1e18;
-      return (oracleOut * bps) / BPS;
-    }
-    if (from == _underlying && to == _supplyAsset) {
-      uint256 oracleOut = (amount * priceBorrowInSupply) / 1e18;
-      return (oracleOut * bps) / BPS;
-    }
-    revert("pair");
-  }
-
+  // Oracle-priced swap through the universal liquidator with a slippage floor.
   function _swap(address from, address to, uint256 amount, uint256 priceSupplyInBorrow, uint256 priceBorrowInSupply) internal {
-    address _universalLiquidator = universalLiquidator();
-    IERC20(from).safeApprove(_universalLiquidator, 0);
-    IERC20(from).safeApprove(_universalLiquidator, amount);
-    uint256 minOut = _minOut(from, to, amount, priceSupplyInBorrow, priceBorrowInSupply);
-    IUniversalLiquidator(_universalLiquidator).swap(from, to, amount, minOut, address(this));
+    AaveReserveLib.swapWithSlippage(
+      universalLiquidator(),
+      from, to, amount,
+      supplyAsset(), underlying(),
+      priceSupplyInBorrow, priceBorrowInSupply,
+      slippageBps()
+    );
   }
 
   function _handleDust(PositionSnap memory s) internal {
-    uint256 baBalance = IERC20(underlying()).balanceOf(address(this));
-    uint256 borrowed = IERC20(borrowAToken()).balanceOf(address(this));
+    address _underlying = underlying();
+    address _supplyAsset = supplyAsset();
+    bool supplyOk = (_supplyFlags() & 2) != 0;
+    uint256 baBalance = IERC20(_underlying).balanceOf(address(this));
     if (baBalance > 0) {
+      uint256 borrowed = IERC20(borrowAToken()).balanceOf(address(this));
+      // Repay still works under freeze; only paused/inactive blocks it.
       if (borrowed > 0) _repay(Math.min(baBalance, borrowed));
-      uint256 rest = IERC20(underlying()).balanceOf(address(this));
-      if (rest > 1e10) {
-        _swap(underlying(), supplyAsset(), rest, s.priceSupplyInBorrow, s.priceBorrowInSupply);
+      uint256 rest = IERC20(_underlying).balanceOf(address(this));
+      // Only convert leftover underlying into collateral if the collateral
+      // side can actually accept it; otherwise leave the underlying idle to
+      // avoid an irreversible swap into a stuck reserve.
+      if (rest > 1e10 && supplyOk) {
+        _swap(_underlying, _supplyAsset, rest, s.priceSupplyInBorrow, s.priceBorrowInSupply);
       }
     }
-    uint256 collatBalance = IERC20(supplyAsset()).balanceOf(address(this));
-    if (collatBalance > 0) {
+    uint256 collatBalance = IERC20(_supplyAsset).balanceOf(address(this));
+    if (collatBalance > 0 && supplyOk) {
       _supply(collatBalance);
     }
   }
@@ -754,11 +781,6 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
     return getUint256(_COLLATERALFACTORNUMERATOR_SLOT);
   }
 
-  function _effectiveCollateralFactorNumerator() internal view returns (uint256) {
-    (,,,uint256 liquidationThreshold,,) = IPool(rewardPool()).getUserAccountData(address(this));
-    return Math.min(collateralFactorNumerator(), liquidationThreshold);
-  }
-
   function setBorrowTargetFactorNumerator(uint256 _numerator) public onlyGovernance {
     require(_numerator < collateralFactorNumerator(), "Bor");
     setUint256(_BORROWTARGETFACTORNUMERATOR_SLOT, _numerator);
@@ -771,7 +793,7 @@ contract Aave2AssetFoldStrategy_debtDenom is BaseUpgradeableStrategy {
   function setFold (bool _fold) public onlyGovernance {
     if (!_fold) {
       setBorrowTargetFactorNumerator(0);
-      _redeemPartial(0, _snapPosition());  
+      _redeemPartial(0, _snapPosition());
       uint256 borrowed = IERC20(borrowAToken()).balanceOf(address(this));
       require (borrowed == 0, "setFold");
     }

@@ -300,6 +300,7 @@ describe("Aave Fold cbETH-ETH oracle-market accounting", function() {
       existingVaultAddress: null,
       strategyArtifact: Strategy,
       strategyArtifactIsUpgradable: true,
+      libraries: ["AaveReserveLib"],
       underlying,
       governance,
       liquidation: [

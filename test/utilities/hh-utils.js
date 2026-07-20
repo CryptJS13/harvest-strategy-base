@@ -4,6 +4,7 @@ const addresses = require("../test-config.js");
 const IController = artifacts.require("IController");
 const Vault = artifacts.require("VaultV2");
 const CLVault = artifacts.require("CLVault");
+const CLRebalanceHelper = artifacts.require("CLRebalanceHelper");
 const VaultProxy = artifacts.require("VaultProxy");
 const IUpgradeableStrategy = artifacts.require("IUpgradeableStrategy");
 const ILiquidatorRegistry = artifacts.require("IUniversalLiquidatorRegistry");
@@ -46,6 +47,8 @@ async function setupCoreProtocol(config) {
       config.CLSetup.targetWidth,
       { from: config.governance }
     );
+    const helper = await CLRebalanceHelper.new({ from: config.governance });
+    await vault.setRebalanceHelper(helper.address, { from: config.governance });
     console.log("New Vault Deployed: ", vault.address);
     console.log(new BigNumber(await vault.balanceOf(config.governance)).toFixed());
   } else {
@@ -154,6 +157,27 @@ async function setupCoreProtocol(config) {
 
   let strategyImpl = null;
 
+  // Optional library linking — pass `libraries: ["AaveReserveLib", ...]` (or
+  // an array of {name, instance}) and the helper deploys & links each one
+  // against the strategy artifact before instantiation.
+  if (Array.isArray(config.libraries) && config.libraries.length > 0) {
+    for (const entry of config.libraries) {
+      let libArtifact, libInstance;
+      if (typeof entry === "string") {
+        libArtifact = artifacts.require(entry);
+        libInstance = await libArtifact.new();
+      } else if (entry && entry.instance) {
+        libInstance = entry.instance;
+      } else if (entry && entry.name) {
+        libArtifact = artifacts.require(entry.name);
+        libInstance = await libArtifact.new();
+      } else {
+        throw new Error("setupCoreProtocol.libraries entry must be a string or {name|instance}");
+      }
+      await config.strategyArtifact.link(libInstance);
+    }
+  }
+
   if (!config.strategyArtifactIsUpgradable) {
     strategy = await config.strategyArtifact.new(
       ...config.strategyArgs,
@@ -197,13 +221,21 @@ async function setupCoreProtocol(config) {
 
   let incentives = null;
   if (addresses.IncentivesGeneral != "0x0000000000000000000000000000000000000000") {
-    incentives = await IncentivesGeneral.at(addresses.IncentivesGeneral);
-    console.log("IncentivesGeneral loaded: ", incentives.address);
+    const code = await web3.eth.getCode(addresses.IncentivesGeneral);
+    if (code && code !== "0x") {
+      incentives = await IncentivesGeneral.at(addresses.IncentivesGeneral);
+      console.log("IncentivesGeneral loaded: ", incentives.address);
+    } else {
+      incentives = await IncentivesGeneral.new(addresses.Storage, { from: config.governance });
+      console.log("IncentivesGeneral deployed (missing historical code): ", incentives.address);
+    }
   } else {
     incentives = await IncentivesGeneral.new(addresses.Storage, { from: config.governance });
     console.log("IncentivesGeneral deployed: ", incentives.address);
   }
-  await strategy.setIncentives(incentives.address, { from: config.governance });
+  if (typeof strategy.setIncentives === "function") {
+    await strategy.setIncentives(incentives.address, { from: config.governance });
+  }
   return [controller, vault, strategy, rewardPool, incentives];
 }
 
